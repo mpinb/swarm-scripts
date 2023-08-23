@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+
+# stop telling me I should use mpi or dask! :)
+
+import sys
+import os
+from datetime import date
+import argparse
+import numpy as np
+from collections import deque
+import glob
+import subprocess
+
+try:
+    from def_common_params import order_txt_fn_str, get_paths, all_wafer_ids, total_nwafers
+    from def_common_params import torn_regions, region_reimage_index, exclude_regions
+except ModuleNotFoundError:
+    print('WARNING: no def_common_params (no msem data support)')
+
+# https://stackoverflow.com/questions/1265665/how-can-i-check-if-a-string-represents-an-int-without-using-try-except
+def isInt_str(v):
+    v = str(v).strip()
+    return v=='0' or (v if v.find('..') > -1 else v.lstrip('-+').rstrip('0').rstrip('.')).isdigit()
+
+parser = argparse.ArgumentParser(description='run_create_swarm.py')
+parser.add_argument('--wafer_ids', nargs='*', type=int, default=[],
+    help='wafer_ids to create the swarm for')
+parser.add_argument('--all-wafers', dest='all_wafers', action='store_true',
+    help='instead of specifying wafer id(s), include all wafers for dataset')
+parser.add_argument('--wafer-region-in', nargs=1, type=str, default=[''],
+    help='specify a text file containing "wafer region" 1-based integers per line')
+parser.add_argument('--reimage-index', nargs=1, type=int, default=[-1],
+    help='specify >= 0 to only add the specified round of re-imaged regions')
+parser.add_argument('--torn-regions', dest='use_torn_regions', action='store_true',
+    help='only iterate over torn regions from def_common_params')
+parser.add_argument('--exclude-regions', dest='use_exclude_regions', action='store_true',
+    help='only iterate over exclude regions from def_common_params')
+parser.add_argument('--no-wafer-id-arg', dest='use_wafer_id_arg', action='store_false',
+    help='use wafer iteration, but do not actually print --wafer_id arg')
+parser.add_argument('--format-str', nargs=1, type=str, default=[''],
+    help='positional path args in order, %%a=wafer_exp_dir %%b=wafer_thumb_dir')
+parser.add_argument('--iterate-ranges', nargs='*', type=int, default=[-1,-1],
+    help='the iteration range(s) for the swarm, multiple ranges for multiple dims')
+parser.add_argument('--iterate-ranges-split', nargs='*', type=int, default=[],
+    help='split the wafer range into this number of portions for each wafer')
+parser.add_argument('--iterate-wafers', dest='iterate_wafers', action='store_true',
+    help='use the range of wafer ids for --iterate-ranges')
+parser.add_argument('--indexing', nargs=1, type=str, default=['ij'], choices=['ij', 'xy'],
+    help='same as meshgrid argument, dimension ordering for iterate_ranges')
+parser.add_argument('--all-slices', dest='all_slices', action='store_true',
+    help='use the total slice count for each wafer (default solved order count)')
+parser.add_argument('--base-zero', dest='base_one', action='store_false',
+    help='specify that iteration range is [0,end_index), default [1,end_index]')
+parser.add_argument('--add-to-range-end', nargs=1, type=int, default=[0],
+    help='use this to modify the end of the range (+/- 1 for example)')
+parser.add_argument('--run-script', nargs=1, type=str, default=[''],
+  help='name of top-level script to create a swarm for (executable, in PATH)')
+parser.add_argument('--beg-args', nargs='+', type=str, default=['blah'],
+  help='the name of the argument for the beginning index (no --)')
+parser.add_argument('--end-args', nargs='*', type=str, default=[None],
+  help='the name of the argument for the end index (no --), None (default) to omit')
+parser.add_argument('--iwafer-iter-arg', nargs=1, type=int, default=[0],
+    help='index in beg-args to the wafer iterator arg')
+parser.add_argument('--cross-wafer-max', nargs=1, type=int, default=[0],
+    help='add cross wafer runs between wafers, either [m,0) (for m < 0) or [0,m)')
+parser.add_argument('--id-str', nargs=1, type=str, default=['none'],
+  help='specify an identifer for the filename, e.g., the run-type')
+parser.add_argument('--date-str', nargs=1, type=str, default=[''],
+    help='override date string for swarm file')
+parser.add_argument('--set-env', nargs=1, type=str, default=[''],
+    help='set environ variables (use quotes), MSEM_NUM_THREADS, PYTHONUNBUFFERED')
+parser.add_argument('--other-flags', nargs=1, type=str, default=[''],
+    help='specify all the other command line arguments (use quotes)')
+# for re-running failures, switched to actually "grep'ing" the swarms outputs in this script for the "secret message"
+#   instead of previous approach of pipeing the find non-zero error swarms to this script.
+parser.add_argument('--fns-remap', nargs=1, type=str, default=[''],
+    help='check swarm file or '' enclosed swarms/glob for failures')
+parser.add_argument('--fns-remap-custom', nargs=1, type=str, default=[''],
+    help='custom message to check for for error reruns')
+parser.add_argument('--remap-cmds-per-job', nargs='+', type=int, default=[0],
+    help='with remap procs packed per job initial run (default infer from swarms)')
+parser.add_argument('--partitions', nargs='*', type=str, default=[],
+    help='parallel to --remap-cmds-per-job, which partition each applies to')
+parser.add_argument('--remap-swarm-ids', nargs='*', type=int, default=[],
+    help='job id for the remap swarm(s) (default check job_id.txt)')
+parser.add_argument('--fn-remap-swarm-dirs', nargs='*', type=str, default=[],
+    help='specify location of previous swarm outputs (default _<fn_remap>)')
+parser.add_argument('--remap-use-error-swarm', dest='remap_use_error_swarm', action='store_true',
+    help='use non-empty swarm error file instead of special message')
+args = parser.parse_args()
+args = vars(args)
+
+# variables straight from argparse
+run_script = args['run_script'][0]
+wafer_ids = args['wafer_ids']
+iterate_ranges_split = args['iterate_ranges_split']
+all_slices = args['all_slices']
+base_one = args['base_one']
+add_to_range_end = args['add_to_range_end'][0]
+beg_args = args['beg_args']
+end_args = args['end_args'] if len(args['end_args']) > 0 else ['']
+iwafer_iter_arg = args['iwafer_iter_arg'][0]
+cross_wafer_max = args['cross_wafer_max'][0]
+id_str = args['id_str'][0]
+date_str = args['date_str'][0]
+set_env = args['set_env'][0]
+other_flags = args['other_flags'][0]
+format_str = args['format_str'][0]
+use_wafer_id_arg = args['use_wafer_id_arg']
+reimage_index = args['reimage_index'][0]
+fns_remap = args['fns_remap'][0].split()
+remap_cmds_per_job = args['remap_cmds_per_job']
+partitions = args['partitions']
+remap_swarm_ids = args['remap_swarm_ids']
+fn_remap_swarm_dirs = args['fn_remap_swarm_dirs']
+remap_use_error_swarm = args['remap_use_error_swarm']
+wafer_region_in = args['wafer_region_in'][0]
+fns_remap_custom = args['fns_remap_custom'][0]
+use_torn_regions = args['use_torn_regions']
+use_exclude_regions = args['use_exclude_regions']
+indexing = args['indexing'][0]
+
+if len(fns_remap) == 1 and os.path.isdir(fns_remap[0]):
+    # assume this is the mrolling format and automatically use the double underscore file
+    #   to get the information for this submission
+    mroll_swarm_fn = os.path.join(fns_remap[0], '_' + fns_remap[0])
+    assert( os.path.isfile(mroll_swarm_fn) ) # this is only meant for mrolling_submit submissions
+    mroll_dn = fns_remap[0].split(os.sep)[-1]
+    mroll_bn = os.path.splitext(mroll_dn)[0]
+    fns_remap[0] = os.path.join(fns_remap[0], mroll_bn[1:] + '.*')
+    if len(remap_cmds_per_job) == 1 and remap_cmds_per_job[0] < 1:
+        # use swarm packing (one command per job) as default if it was not specified
+        remap_cmds_per_job[0] = 1
+else:
+    mroll_swarm_fn = None
+
+# variables computed from argparse vars
+nfns_remap = len(fns_remap)
+if nfns_remap == 0:
+    if not run_script: run_script = 'foobar.py'
+else:
+    tmp = os.path.split(fns_remap[0])[-1].split('-')
+    run_script = tmp[1] + '.py'
+    if id_str == 'none':
+        id_str = os.path.splitext('-'.join(tmp[2:]))[0] + '-reruns'
+if use_exclude_regions:
+    assert(not wafer_region_in) # not implemented
+    assert(not use_torn_regions) # not implemented
+    special_regions = exclude_regions
+if use_torn_regions:
+    assert(not wafer_region_in) # not implemented
+    assert(not use_exclude_regions) # not implemented
+    special_regions = torn_regions
+if use_exclude_regions or use_torn_regions:
+    wafer_ids_regions = np.zeros((0,2), dtype=np.uint32)
+    for i in all_wafer_ids:
+        nspecial = len(special_regions[i])
+        if nspecial > 0:
+            tmp = np.zeros((nspecial,2), dtype=np.uint32)
+            tmp[:,1] = special_regions[i]
+            tmp[:,0] = i
+            wafer_ids_regions = np.concatenate((wafer_ids_regions, tmp), axis=0)
+    wafer_region_in = True
+elif wafer_region_in:
+    wafer_ids_regions = np.fromfile(wafer_region_in, dtype=np.uint32, sep=' ').reshape(-1,2)
+if wafer_region_in:
+    assert(reimage_index < 0) # not implemented
+    print('Only iterating {} specified regions'.format(wafer_ids_regions.shape[0]))
+    wafer_ids = np.unique(wafer_ids_regions[:,0])
+    wafer_regions = [wafer_ids_regions[wafer_ids_regions[:,0]==x,1] for x in wafer_ids]
+else:
+    if args['all_wafers']:
+        wafer_ids = list(all_wafer_ids)
+if not date_str:
+    date_str = date.today().strftime('%Y%m%d')
+nwafer_ids = len(wafer_ids)
+base_run_script, _ = os.path.splitext(os.path.split(run_script)[1])
+fn = '{}-{}-{}.swarm'.format(date_str, base_run_script, id_str)
+
+if args['iterate_wafers']:
+    iterate_ranges = [np.array([1,total_nwafers+1]).reshape(1,2)]
+else:
+    iterate_ranges = np.array(args['iterate_ranges']).reshape((-1,2))
+    valid_iterate_range = (iterate_ranges[0] > -1).all()
+    if valid_iterate_range and (iterate_ranges[:,1] - iterate_ranges[:,0] < 1).any():
+        with open(fn, "w") as outfile:
+            outfile.write("echo noop\n")
+        print("At least one range empty, writing noop swarm file")
+        sys.exit()
+    iterate_ranges = [iterate_ranges.copy() for x in range(nwafer_ids if nwafer_ids > 0 else 1)]
+valid_iterate_range = (iterate_ranges[0] > -1).all()
+if valid_iterate_range:
+    # specify to use the iterate_ranges but NOT iterate the slices in each wafer
+    use_iterate_range = len(beg_args)==iterate_ranges[0].shape[0]
+else:
+    use_iterate_range = False
+
+beg_args = [x.strip() for x in beg_args]
+end_args = [x.strip() if x is not None else None for x in end_args]
+
+def _get_unrolled_iterate_ranges(iwafer):
+    # add the slice iteration to the dimensions to iterate
+    if use_wafer_iterate_range:
+        citerate_ranges = np.concatenate((iterate_ranges[iwafer][:iwafer_iter_arg,:],
+                np.array(iter_rng)[None,:], iterate_ranges[iwafer][iwafer_iter_arg:,:]))
+        if wafer_region_in:
+            iinds = [None]*citerate_ranges.shape[0]; iinds[iwafer_iter_arg] = wafer_regions[iwafer]
+            tmp = np.meshgrid(*[s if s is not None else np.arange(x,y) for x,y,s \
+                    in zip(citerate_ranges[:,0], citerate_ranges[:,1], iinds)], indexing=indexing)
+        else:
+            iter_sels = [None]*citerate_ranges.shape[0]; iter_sels[iwafer_iter_arg] = iter_sel
+            tmp = np.meshgrid(*[np.arange(x,y)[s] if s is not None else np.arange(x,y) for x,y,s \
+                    in zip(citerate_ranges[:,0], citerate_ranges[:,1], iter_sels)], indexing=indexing)
+        _unrolled_iterate_ranges = np.concatenate([x.flat[:][:,None] for x in tmp], axis=1)
+    else:
+        if isinstance(iter_rng[0], list):
+            # for supporting iterate_ranges_split
+            assert(iter_sel is None) # iterate_ranges_split does not work with reimage_index
+            _unrolled_iterate_ranges = [np.array([x[0] for x in iter_rng]), np.array([x[-1] for x in iter_rng])]
+        else:
+            _unrolled_iterate_ranges = np.arange(iter_rng[0],iter_rng[1])[:,None]
+            isel = np.in1d(_unrolled_iterate_ranges[:,0], wafer_regions[iwafer]) if wafer_region_in else iter_sel
+            if isel is not None: _unrolled_iterate_ranges = _unrolled_iterate_ranges[isel,:]
+    return _unrolled_iterate_ranges
+
+# https://docs.python.org/2/library/collections.html#deque-recipes
+def tail(filename, n=10):
+    'Return the last n lines of a file'
+    return deque(open(filename), n)
+
+if nfns_remap > 0:
+    # this is just for re-running error jobs, works along with success message in output
+    #   and by default uses the rolling_submit job_id/swarm_subdir format.
+
+    # if it's a single argument, check for a glob
+    if nfns_remap == 1:
+        fns_remap = glob.glob(fns_remap[0])
+        fns_remap.sort()
+        nfns_remap = len(fns_remap)
+
+    error_cnt = 0; error_jobs = []; nswarms = 0
+    with open(fn, "w") as outfile:
+        for fn_remap,x in zip(fns_remap, range(nfns_remap)):
+            print(fn_remap)
+            if len(fn_remap_swarm_dirs) == 0:
+                tmp = fn_remap.split(os.sep)
+                tmp[-1] = '_' + tmp[-1]
+                fn_remap_swarm_dir = os.sep.join(tmp)
+            else:
+                fn_remap_swarm_dir = fn_remap_swarm_dirs[x]
+            if len(remap_swarm_ids) == 0:
+                with open(os.path.join(fn_remap_swarm_dir, 'job_id.txt'), "r") as jobfile:
+                    remap_swarm_id = int(jobfile.read())
+            else:
+                remap_swarm_id = remap_swarm_ids[x]
+
+            if len(remap_cmds_per_job) == 1:
+                if remap_cmds_per_job[0] < 1:
+                    oswarms = glob.glob(os.path.join(fn_remap_swarm_dir, 'swarm_*.o'))
+                    noswarms = len(oswarms); cnt = 0
+                    sub_jobs = np.zeros(noswarms, dtype=np.int16)
+                    for i in range(noswarms):
+                        tmp, _ = os.path.splitext(oswarms[i])
+                        tmp = tmp.split('_')
+                        if len(tmp) > 1 and isInt_str(tmp[-1]):
+                            sub_jobs[cnt] = int(tmp[-1]); cnt += 1
+                    cremap_cmds_per_job = sub_jobs.max() + 1
+                    print('cremap_cmds_per_job={}'.format(cremap_cmds_per_job))
+                else:
+                    cremap_cmds_per_job = remap_cmds_per_job[0]
+            else:
+                fn_remap_jobhist = os.path.join(fn_remap_swarm_dir, 'jobhist.txt')
+                if os.path.isfile(fn_remap_jobhist):
+                    partition_str = '--partition'
+                    partition = None
+                    with open(fn_remap_jobhist, "r") as histfile:
+                        for line in histfile:
+                            if partition_str in line:
+                                # first instance in the jobhist.txt file should be the swarm arg, --partition=
+                                partition = line[line.index(partition_str) + len(partition_str) + 1:].split()[0]
+                                break
+                    assert(partition is not None) # jobhist.txt found but partition not found in file
+                else:
+                    # this method is super slow, so try to avoid this if possible,
+                    # for example, by running jobhist first so that jobhist.txt is present.
+                    'sacct -n -j {} --format partition'.format(remap_swarm_id)
+                    # get info from sacct
+                    sacct_output = subprocess.Popen(['sacct', '-n', '-j', str(remap_swarm_id),
+                                                    '--format', 'partition'],
+                                                    stdout=subprocess.PIPE,
+                                                    stderr=subprocess.PIPE,
+                                                    encoding='utf8').communicate()
+                    partition = sacct_output[0].split()[0]
+                cremap_cmds_per_job = remap_cmds_per_job[partitions.index(partition)]
+            # if len(remap_cmds_per_job) == 1:
+
+            # find all errors by checking output files for the "special message"
+            with open(fn_remap, "r") as infile:
+                k = -1
+                for rline in infile:
+                    line = rline.strip()
+                    if not line or line[0] == '#': continue
+                    k += 1; nswarms += 1; i = k//cremap_cmds_per_job; j = k%cremap_cmds_per_job
+
+                    if remap_use_error_swarm:
+                        swarm_fn = os.path.join(fn_remap_swarm_dir, 'swarm_{}_{}_{}.e'.format(remap_swarm_id,i,j))
+                        iserr = os.path.isfile(swarm_fn) and (os.path.getsize(swarm_fn) > 0)
+                    else:
+                        swarm_fn = os.path.join(fn_remap_swarm_dir, 'swarm_{}_{}_{}.o'.format(remap_swarm_id,i,j))
+                        if fns_remap_custom:
+                            iserr = False
+                            # grep the whole swarm output file for the custom message
+                            if os.path.isfile(swarm_fn):
+                                with open(swarm_fn, 'r') as f:
+                                    for sline in f.readlines():
+                                        if fns_remap_custom in sline:
+                                            iserr = True; break
+                        else:
+                            iserr = not os.path.isfile(swarm_fn) or 'Twas brillig, and the slithy toves' not in \
+                                    ''.join(list(tail(swarm_fn)))
+                    if iserr:
+                        error_cnt += 1
+                        print(line, file=outfile)
+                        error_jobs += ['{}-{}_{}'.format(fn_remap,i,j)]
+        #for fn_remap,x in zip(fns_remap, range(nfns_remap)):
+    #with open(fn, "w") as outfile:
+
+    print(error_jobs)
+    print('Wrote {} error lines out of {} lines in swarm(s) to output swarm'.format(error_cnt,nswarms))
+    print(fn) # for easy awk mangling of output if necessary (gpus for example)
+    sys.exit()
+
+if valid_iterate_range and use_iterate_range:
+    use_wafer_ids = [0] if nwafer_ids == 0 else wafer_ids
+    for wafer_id,iwafer in zip(use_wafer_ids, range(len(use_wafer_ids))):
+        tmp = np.meshgrid(*[range(x,y) for x,y in iterate_ranges[iwafer]], indexing=indexing)
+        unrolled_iterate_ranges = np.concatenate([x.flat[:][:,None] for x in tmp], axis=1)
+        use_iters = [unrolled_iterate_ranges]*(max(use_wafer_ids)+1)
+else:
+    # still optionally use the iterate range but along with iterating slices in each wafer
+    use_wafer_iterate_range = len(beg_args)-1==iterate_ranges[0].shape[0]
+
+    assert(nwafer_ids > 0) # have to either iterate with iterate_ranges or iterate over wafer slices
+    use_iters = [None]*(max(wafer_ids)+1)
+    use_wafer_ids = wafer_ids
+    for wafer_id,iwafer in zip(use_wafer_ids, range(len(use_wafer_ids))):
+        _, _, _, alignment_folder, _, region_strs = get_paths(wafer_id)
+        nregions = sum([len(x) for x in region_strs])
+
+        ## region_strs is a list of lists unfortunately, seperated by experiment folders. flatten.
+        #region_strs_flat = [item for sublist in region_strs for item in sublist]
+        order_txt_fn = os.path.join(alignment_folder, order_txt_fn_str.format(wafer_id))
+
+        if all_slices:
+            iterlen = nregions
+        else:
+            solved_order = np.fromfile(order_txt_fn, dtype=np.uint32, sep=' ')-1 # saved order is 1-based
+            iterlen = solved_order.size
+        iter_rng = [1,iterlen+1+add_to_range_end] if base_one else [0,iterlen+add_to_range_end]
+
+        if len(iterate_ranges_split) > 0:
+            iter_rng = [[x[0], x[-1]+1] for x in np.array_split(np.arange(iter_rng[0],iter_rng[1]),
+                iterate_ranges_split[iwafer])]
+
+        iter_sel = (region_reimage_index[wafer_id] == reimage_index) if reimage_index > -1 else None
+
+        use_iters[wafer_id] = _get_unrolled_iterate_ranges(iwafer)
+# else - if valid_iterate_range and use_iterate_range:
+nwafer_ids = len(use_wafer_ids)
+
+def _iterate_ranges(_use_iters, _wafer_str, _f):
+    if isinstance(_use_iters, list):
+        is_wafer_split = True
+        _use_iters_end = _use_iters[1][:,None]
+        _use_iters = _use_iters[0][:,None]
+    else:
+        is_wafer_split = False
+    for j in range(_use_iters.shape[0]):
+        if format_str:
+            iter_ind0 = use_iters[wafer_id][j] - (1 if base_one else 0)
+            clens = np.cumsum(np.array([len(x) for x in region_strs]))
+            exp_ind = np.nonzero(iter_ind0 / clens < 1.)[0][0]
+            experiment_folder = experiment_folders[exp_ind]
+            thumbnail_folder = thumbnail_folders[exp_ind] if len(thumbnail_folders) > 0 else thumbnail_folders
+
+            format_str_str = str(format_str)
+            format_str_str = format_str_str.replace('%a',experiment_folder)
+            format_str_str = format_str_str.replace('%b',thumbnail_folder)
+        else:
+            format_str_str = ''
+
+        beg_iter_str = ''; end_iter_str = ''
+        for k in range(_use_iters.shape[1]):
+            if is_wafer_split:
+                beg_iter_str += '--{} {} {}'.format(beg_args[k], _use_iters[j,k], _use_iters_end[j,k])
+            elif k > 0 and beg_args[k-1] == beg_args[k]:
+                # allow for single arg to be used for multiple ranges (for example --iblock x y)
+                beg_iter_str += '{}'.format(_use_iters[j,k])
+            elif beg_args[k] != 'None':
+                beg_iter_str += '--{} {}'.format(beg_args[k], _use_iters[j,k])
+            if k < _use_iters.shape[1]-1: beg_iter_str += ' '
+            if end_args[0] is not None:
+                # in a situation where some end args are desired and some not, specify None on command line to skip
+                if end_args[k] != 'None':
+                    if end_args[k]:
+                        end_iter_str += '--{} {}'.format(end_args[k], _use_iters[j,k]+1)
+                    else:
+                        # end_arg without argument (for example, second argument to a range for beg_arg)
+                        # this actually has to be appended to beg_iter_str to support multiple arg ranges.
+                        if k == _use_iters.shape[1]-1: beg_iter_str += ' '
+                        beg_iter_str += '{}'.format(_use_iters[j,k]+1)
+                        if k < _use_iters.shape[1]-1: beg_iter_str += ' '
+                    if k < _use_iters.shape[1]-1: end_iter_str += ' '
+        swarm_str = ' '.join([set_env, run_script, format_str_str, _wafer_str,
+                beg_iter_str, end_iter_str, other_flags,])
+        print(swarm_str, file=_f)
+    #for j in range(num):
+
+with open(fn, 'w') as f:
+    for wafer_id,iwafer in zip(use_wafer_ids, range(len(use_wafer_ids))):
+        if wafer_id > 0:
+            experiment_folders, thumbnail_folders, _, alignment_folder, _, region_strs = get_paths(wafer_id)
+            wafer_str = '--wafer_ids {}'.format(wafer_id) if use_wafer_id_arg else ''
+        else:
+            wafer_str = ''
+        _iterate_ranges(use_iters[wafer_id], wafer_str, f)
+
+        if cross_wafer_max != 0 and (iwafer < len(use_wafer_ids)-1):
+            assert(wafer_id > 0) # cross-wafer does not make sense without specifying wafers
+            wafer_str = '--wafer_ids {} {}'.format(wafer_id, use_wafer_ids[iwafer+1])
+            # kind of kludgy support to add some cross wafer runs to end of each wafer
+            iter_rng = [0,cross_wafer_max] if cross_wafer_max > 0 else [cross_wafer_max,0]
+            iter_sel = None
+
+            # add the cross wafer iteration to the dimensions to iterate
+            unrolled_iterate_ranges = _get_unrolled_iterate_ranges(iwafer)
+            _iterate_ranges(unrolled_iterate_ranges, wafer_str, f)
+
+print(fn) # for easy awk mangling of output if necessary (gpus for example)

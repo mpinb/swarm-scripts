@@ -1,0 +1,97 @@
+#!/usr/bin/perl
+
+# Susan may 2015
+
+my $host = `hostname -s`;
+chop $host;
+if ($host eq "helix") {
+    print "\n*** ERROR: the batchlim command cannot be run on Helix\nPlease run batchlim on Biowulf to see the batch system limits\n\n";
+    exit 1;
+}
+open (IN, "/usr/bin/scontrol -o show part | ");
+while (<IN>) {
+	my $name;
+	(/PartitionName=(\S*)/) && ($name = $1);
+	(/DefaultTime=(\S*)/) && ($default_wall{$name} = $1);
+	(/MaxNodes=(\S*)/) && ($max_nodes{$name} = $1);
+	(/MaxTime=(\S*)/)     && ($max_wall{$name} = $1);
+	(/Priority=(\S*)/) && ($priority{$name} = $1);
+	(/MaxMemPerNode=(\S*)/) && ($max_mem{$name} = $1);
+}
+close (IN);
+
+open (IN, "/usr/bin/sacctmgr -np show qos format=Name%12,MaxCPUSPerUser |");
+while (<IN>) {
+	(my $name, my $max) = split(/\|/,$_);
+
+	# skip the 'normal' and 'staff' QoSs
+	#($name =~ /normal|staff|ccrprio|global|turbo/) && next;
+	($name =~ /small|express|short|general|interactive|broadwell|gpu|test/) && next;
+	#($name =~ /^norm$/)  && next;
+	#($name =~ /^ccr$/)   && next;
+	#($name =~ /^niddk$/) && next;
+	#($name =~ /^nimh$/)  && next;
+	#($name =~ /^b1_part$/) && next;
+
+	# replace the name _part with just name
+	$name =~ s/_part//g;
+
+	$limit{$name} = $max;
+	#print "$name $limit{$name}\n";
+}
+
+
+$max_jobs = `sacctmgr -pn show cluster | cut -d'|' -f11`;
+$max_array = `scontrol show config | grep MaxArraySize | awk '{print \$3}'`;
+chop $max_jobs;
+
+$sacctmgr_out = `sacctmgr -n show qos gpu_part format=maxtresperuser%-24`;
+$sacctmgr_out =~ /cpu=\d+,gres\/gpu=(\d+)/;
+$max_gpus = $1 if($1);
+
+$sacctmgr_out = `sacctmgr -n show qos ccrgpu_part format=maxtresperuser%-24`;
+$sacctmgr_out =~ /cpu=\d+,gres\/gpu=(\d+)/;
+$ccr_max_gpus = $1 if($1);
+
+$sacctmgr_out = `sacctmgr -n show qos student format=maxtresperuser%-24`;
+$sacctmgr_out =~ /cpu=\d+,gres\/gpu=(\d+)/;
+$student_max_gpus = $1 if($1);
+
+$sacctmgr_out = `sacctmgr -pn show qos turbo format=maxtresperuser%-24,maxwall`;
+($sacctmgr_out =~ /cpu=(\d+)\|(.*)\|/) && (($max_turbo,$max_wall_turbo) = ($1,$2));
+
+print "\n";
+printf("Max jobs per user: %4d\n", $max_jobs);
+printf("Max array size:    %4d\n", $max_array);
+###printf("Max gpus per user: %4d\n", $max_gpus);
+print "\n";
+
+
+printf  "%-12s %15s %15s %10s %10s\n","Partition","DefWalltime","MaxWalltime","MaxNodes","MaxMem";
+print "---------------------------------------------------------------------\n";
+foreach $part (sort bytext keys %default_wall) {
+	($part =~ /bnpprio|centos7|phi/) && next;
+	printf "%-12s %15s %15s %10s %10s   ",$part,$default_wall{$part},$max_wall{$part},$max_nodes{$part},$max_mem{$part};
+	if ($part =~ /multinode/) {
+		print "\n\tturbo qos        $max_turbo                         $max_wall_turbo";
+	}
+	if ($part =~ /interactive/) {
+		print "(3 simultaneous jobs)";
+	}
+	if ($part =~ /^gpu$/) {
+		print "($max_gpus GPUs per user)";
+	}
+      if ($part =~ /^ccrgpu$/) {
+		print "($ccr_max_gpus GPUs per user)";
+	}
+      if ($part =~ /^student$/) {
+		print "($student_max_gpus GPUs per user)";
+	}
+	print "\n";
+}
+
+sub bytext {
+  my @custom_order = qw/ norm multinode interactive quick largemem gpu unlimited student ccr ccrgpu ccrclin ccrlcb ccrlcbgpu niddk nimh /;
+  my %order = map +($custom_order[$_] => $_), 0 .. $#custom_order ;
+  $order{$a} <=> $order{$b};
+  }

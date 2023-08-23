@@ -1,0 +1,11 @@
+#name        deps        swarm             part        nproc   ngpu  time_hrs  slurm_pack  mroll_cutoff
+packcpu      ,           idle-test-1       CPU         48      0     1         0           0
+packgpu      ,           idle-test-2       GPU         48      4     1         0           0
+slpackcpu    packcpu     idle-test-3       CPU         48      0     1         1           0
+slpackgpu    packgpu     idle-test-4       GPU         48      0     1         1           0
+# by default runs on the first partition specified
+eitherpart   slpackcpu   idle-test-5       CPU/GPU     48/48   0/0   1/1       0           0
+eitherpack   eitherpart  idle-test-6       CPU/GPU     48/48   0/0   1/1       1           0
+#mroll        eitherpack  idle-test-7       CPU/GPU     48/48   0/4   1/1       0           60     # no-mroll-all
+mroll        eitherpack  idle-test-7       CPU/GPU     48/48   0/4   1/1       0           60     # no-mroll-all
+mrollpack    mroll       idle-test-8       CPU/GPU     48/48   0/0   1/1       1           60

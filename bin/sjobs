@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+
+# Replaces the original biowulf sjobs using a much simpler wrapper to squeue.
+# sjobs was dependent on the slurm perl module, which was troublesome to install / maintain / port.
+
+import argparse
+
+# import os
+# import glob
+import sys
+import shlex
+import subprocess
+
+def echo_and_run(cmd, mock_run, verbose):
+    if verbose: print(cmd)
+    lines = []
+    if not mock_run:
+        command = shlex.split(cmd)
+        proc = subprocess.Popen(command, stdout = subprocess.PIPE)
+        for line in proc.stdout:
+            cline = line.decode()[:-1]
+            if cline.strip(): lines.append(cline)
+            if verbose: print(cline)
+        proc.communicate()
+    return lines
+
+parser = argparse.ArgumentParser(description='sjobs')
+parser.add_argument('-a', '--all', dest='all_users', action='store_true',
+    help='show all users')
+parser.add_argument('-u', '--user', nargs=1, type=str, default=[''],
+    help='show selected user')
+parser.add_argument('-p', '--partition', nargs=1, type=str, default=[''],
+    help='show selected partition')
+parser.add_argument('--running', dest='running', action='store_true',
+    help='show all users')
+parser.add_argument('--pending', dest='pending', action='store_true',
+    help='show all users')
+parser.add_argument('-n', '--show-name', dest='show_name', action='store_true',
+    help='only display the squeue command line')
+parser.add_argument('-s', '--summary', dest='summary', action='store_true',
+    help='only display the running/pending summary')
+parser.add_argument('--show-cmd', dest='show_cmd', action='store_true',
+    help='only display the squeue command line')
+args = parser.parse_args()
+args = vars(args)
+
+# variables straight from argparse
+user = args['user'][0]
+partition = args['partition'][0]
+all_users = args['all_users']
+running = args['running']
+pending = args['pending']
+show_name = args['show_name']
+summary = args['summary']
+show_cmd = args['show_cmd']
+
+# fixed params not exposed
+#meh='meh'
+
+# create squeue command based on args
+if show_name:
+#    USER                 JOBID     NAME PARTITION ST       TIME TIME_LIMIT  NODES CPUS MIN_MEM NODELIST(REASON)
+    cmd = 'squeue -o "%.8u %.21i %.8j %.9P %.2t %.10M %.10l %.6D %.4C %.7m %R"'
+else:
+#    USER                 JOBID PARTITION ST       TIME TIME_LIMIT  NODES CPUS MIN_MEM NODELIST(REASON)
+    cmd = 'squeue -o "%.8u %.21i %.9P %.2t %.10M %.10l %.6D %.4C %.7m %R"'
+cmd += ' --sort="P,u,-t,i" '
+if user:
+    cmd += ' -u {} '.format(user)
+elif not all_users:
+    cmd += ' --me '
+if partition:
+    cmd += ' -p {} '.format(partition)
+states = []
+if pending: states += ['PD']
+if running: states += ['R']
+states = ','.join(states)
+if states:
+    cmd += ' --states {} '.format(states)
+
+# run the squeue command and get returned output
+if show_cmd:
+    print(cmd)
+    sys.exit(0)
+result = echo_and_run(cmd, False, False)
+
+if len(result) < 2:
+    print('No jobs pending or running')
+else:
+    if not summary:
+        for line in result: print(line)
+
+    # need pending array jobs unrolled to get corect count
+    cmd += ' -r '
+    result = echo_and_run(cmd, False, False)
+    # get sums of running and pending jobs
+    nrunning = npending = 0
+    nrunning_cpus = npending_cpus = 0
+    iline = [4,8] if show_name else [3,7]
+    for line in result[1:]:
+        #print(line)
+        sline = line.split()
+        if sline[iline[0]] == 'R':
+            nrunning += 1
+            nrunning_cpus += int(sline[iline[1]])
+        if sline[iline[0]] == 'PD':
+            npending += 1
+            npending_cpus += int(sline[iline[1]])
+
+    # do NOT change these lightly, downstream scripts dependent on exact output
+    # xxx - could have other scripts call squeue directly?
+    print('cpus running = {}'.format(nrunning_cpus))
+    print('cpus pending = {}'.format(npending_cpus))
+    print('jobs running = {}'.format(nrunning))
+    print('jobs pending = {}'.format(npending))

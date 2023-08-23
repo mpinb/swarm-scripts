@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+
+# This is a wrapper/utility for rolling_submit that allows jobs to be submitted
+#   over multiple slurm partitions. Typically this must be done by dividing the
+#   jobs up statically beforehand. This script is meant to be run as a background
+#   job that monitors submitted / running jobs and submits more jobs based on a
+#   simple threshold and a specified chunk size for each submission.
+# rolling_submit already creates subdirs for all the logs files, and copies a text file
+#   into the subdir that contians the job id of the submission. This script creates
+#   another top level directory for the entire submission, with rolling_submit creating
+#   subdirectories for each chunk submission.
+
+
+# single swarm file to be divided up.
+# this script does the chunking, meaning this input is a single swarm file,
+#   not a wildcard as supported by rolling_submit.
+#swarm=
+
+# how large each submitted swarm chunk should be.
+# should take njobs per node (-p option to swarm) and
+#   the max slurm job array size into account.
+# specifically should be multiple of njobs per node.
+#swarm_chunksize=
+
+# when total of queued and running jobs is less than this, submit next swarm chunk
+njob_cutoffs=()
+
+# list of swarm partitions to submit to.
+# theretically this could be pulled from the options, but.... whatever.
+partitions=()
+
+# list of swarm/aswarm options sent to rolling_submit.
+# list is parallel to partitions, so each set should be ""-delimited
+nswarm_opts=0
+
+# polling time in seconds, for really long jobs, recommend 10 mins or more
+sleep_time=600
+
+# to run but not actually execute the swarm commands, for debug / test submissions.
+# leave undefined to execute the submission commands.
+#no_run=
+
+# if the swarm subdirectory already exists, forcibly remove and continue.
+# if force or restart are not specified, exit with error message
+#force=
+
+# if the swarm subdirectory already exists, start with next job chunk,
+#   i.e., only start chunks where the swarm subdirectory does not already exist.
+# if force or restart are not specified, exit with error message
+#restart=
+
+# after all the submissions are completed whether to wait.
+# NOTE: this does NOT automatically add -W to sbatch, need to speficy this also
+#do_wait=
+
+#cnt=0
+for var in "$@"; do
+    if [ "$getting_swarm_opts" == "true" ]; then
+        if [[ "$var" =~ ^--.*  ]]; then
+            getting_swarm_opts=false
+        fi
+    fi
+
+    if [ "$get_swarm" == "true" ]; then
+        swarm=$var
+        get_swarm=false
+    elif [ "$get_swarm_chunksize" == "true" ]; then
+        swarm_chunksize=$var
+        get_swarm_chunksize=false
+    elif [ "$get_njob_cutoffs" == "true" ]; then
+        njob_cutoffs=($var)
+        get_njob_cutoffs=false
+    elif [ "$get_partitions" == "true" ]; then
+        partitions=($var)
+        get_partitions=false
+    elif [ "$getting_swarm_opts" == "true" ]; then
+        # xxx - could not get this to work without bash dynamic variables
+        export swarm_opts_${nswarm_opts}="$var"
+        nswarm_opts=$((nswarm_opts+1))
+    elif [ "$get_sleep_time" == "true" ]; then
+        sleep_time=$var
+        get_sleep_time=false
+    fi
+
+    if [ "$var" == "--swarm" ]; then
+        get_swarm=true
+    elif [ "$var" == "--swarm_chunksize" ]; then
+        get_swarm_chunksize=true
+    elif [ "$var" == "--njob_cutoffs" ]; then
+        get_njob_cutoffs=true
+    elif [ "$var" == "--partitions" ]; then
+        get_partitions=true
+    elif [ "$var" == "--swarm_opts" ]; then
+        getting_swarm_opts=true
+        nswarm_opts=0
+    elif [ "$var" == "--sleep_time" ]; then
+        get_sleep_time=true
+    elif [ "$var" == "--no-run" ]; then
+        no_run=true
+    elif [ "$var" == "--force" ]; then
+        force=true
+    elif [ "$var" == "--restart" ]; then
+        restart=true
+    elif [ "$var" == "--wait" ]; then
+        do_wait=true
+    fi
+
+done
+
+echo "Specified options:"
+echo "swarm: ${swarm}"
+echo "swarm_chunksize: ${swarm_chunksize}"
+echo "njob_cutoffs:"
+echo ${njob_cutoffs[*]}
+echo "partitions to submit to:"
+echo ${partitions[*]}
+echo "swarm_opts:"
+for j in ${!partitions[@]}; do
+    eval "echo \$swarm_opts_${j}"
+done
+echo "sleep_time: ${sleep_time}"
+echo "no-run: ${no_run}"
+echo "force: ${force}"
+echo "restart: ${restart}"
+echo "wait: ${do_wait}"
+echo
+#exit
+
+if [ ${#partitions[@]} -eq 0 ] || [ ${nswarm_opts} -eq 0 ] || [ -z ${swarm} ] || [ -z ${swarm_chunksize} ] \
+      || [ ${#njob_cutoffs[@]} -eq 0 ]; then
+    echo "some required args missing"
+    echo "USAGE: mrolling_submit"
+    echo "  required:"
+    echo "  --swarm <str>             names of swarm to split / submit"
+    echo "  --swarm_chunksize <int>   size to break swarm file into, each submitted as single array job"
+    echo "  --njob_cutoffs <int> ...  quote-encluded list of max running/queued njobs per partition"
+    echo "  --partitions <str> ...    quote-enclosed list of partitions to submit to"
+    echo "  --swarm_opts <str> ...    list of quote-enclosed options to send to swarm command"
+    echo "  optional (with defaults):"
+    echo "  --sleep_time <int>        how long to wait (secs) before polling jobs again, default 600"
+    echo "  optional (default is off):"
+    echo "  --no-run                  do no actually submit anything, for debug/verify"
+    echo "  --restart                 if the swarm subdir already exists, restart remaining swarms"
+    echo "  --force                   if the swarm subdir already exists, remove/start over"
+    echo "  --wait                    wait for the submissions to finish, -W to sbatch NOT auto added"
+    echo "run in background using for example:"
+    echo "  nohup <mrolling_submit_cmd> >& mrolling_submit_out.txt &"
+    echo "get full jobhist for mrolling_submit jobs:"
+    echo "  jobhist _<swarm_file>.swarm"
+    echo
+    aswarm
+    exit
+fi
+
+# pass the no-run flag onto rolling_submit
+if [ -n "$no_run" ]; then
+  no_run_flag=--no-run
+fi
+
+# run the sub-command in the background if we are going to wait
+if [ -n "$do_wait" ]; then
+  bg_flag='&'
+else
+  unset bg_flag
+fi
+
+# if a swarm file path other than cwd is specified, then copy locally and use the local file
+swarm_fn=$(basename -- "$swarm")
+if [ "$swarm_fn" != "$swarm" ]; then
+  cp $swarm ./
+  swarm=${swarm_fn}
+fi
+
+# create the top level dir
+subdir=_${swarm}
+if [[ -d ${subdir} ]] && [ -z "$restart" ]; then
+  if [ -z "$force" ]; then
+    echo "'${subdir}' exists and force / restart not specified"
+    exit
+  else
+    rm -rf ${subdir}
+  fi
+fi
+if [[ -d ${subdir} ]] && [ -n "$restart" ]; then
+  echo "'${subdir}' exists, restart specified, run remaining swarms"
+else
+  unset restart
+  mkdir ${subdir}
+  cp ${swarm} ${subdir}
+fi
+
+cd ${subdir}
+swarm_fn="${swarm%.*}"
+
+if [ -z "$restart" ]; then
+  # split up the swarm file
+  split -l ${swarm_chunksize} ${swarm} ${swarm_fn}.
+
+  # after the split, prepend two underscores to the original swarmfile.
+  #   this is so we can glob using the original swarmfile name and
+  #   not have it include the original swarmfile. use two underscores so
+  #   we could also glob on the subdirectories created by rolling_submit.
+  # it is still a good idea to keep the copy in the subdirectory
+  #   in case of problems or accidentally deleting the original.
+  mv ${swarm} __${swarm}
+fi
+
+# iterate over the split swarm files
+swarms=(${swarm_fn}.*)
+i=0; j=0; c=0
+while [ $i -lt ${#swarms[@]} ]; do
+  ## skip over the original swarm file
+  #if [ "${swarms[$i]}" == "${swarm}" ]; then
+  #  i=$((i+1))
+  #  continue
+  #fi
+  # if this is a restart job and the subdirectory for the split swarm is already there, then skip
+  subsubdir=_${swarms[$i]}
+  if [ -n "$restart" ] && [[ -d ${subsubdir} ]]; then
+    i=$((i+1))
+    continue
+  fi
+
+  ntotal=$(sjobs -p ${partitions[$j]} 2>&1 | tail -2 | awk '{s+=$4} END {print s}')
+  echo ${partitions[$j]} $ntotal jobs running or submitted $(date)
+  if [ $ntotal -lt ${njob_cutoffs[$j]} ]; then
+    swarm_opt=$(eval "echo \$swarm_opts_${j} ")
+    cmd="rolling_submit --swarms ${swarms[$i]} --swarm_opts \" ${swarm_opt} \" $no_run_flag $bg_flag"
+    echo $cmd
+    eval $cmd
+    printf "\n\n\n\n\n"
+    i=$((i+1))
+    c=0
+  else
+    c=$((c+1))
+  fi
+  j=$(((j+1) % ${#partitions[@]}))
+
+  if [ $c -ge ${#partitions[@]} ] && [ $((c % ${#partitions[@]})) -eq 0 ]; then
+    sleep ${sleep_time}
+  fi
+done
+
+# use this in combination with -W to sbatch to wait for job completions.
+# the use case is if this mrolling_submit is submitted as a master job,
+#   then all the subsequent dependecies can just be on this master job and
+#   not all actual jobs that were submitted by this script.
+if [ -n "$do_wait" ]; then
+  wait
+fi
+
+# in case this was submitted as a job
+#echo Twas brillig, and the slithy toves

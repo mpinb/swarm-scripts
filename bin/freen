@@ -1,0 +1,113 @@
+#!/usr/bin/env python 
+#
+# Susan, Jul 2014
+#
+
+import sys,getopt,os
+from sys import argv
+import subprocess as sp
+#import commands
+
+def get_status_output(cmd, input=None, cwd=None, env=None):
+    pipe = sp.Popen(cmd, shell=True, cwd=cwd, env=env, stdout=sp.PIPE, stderr=sp.STDOUT)
+
+    (output, errout) = pipe.communicate(input=input)
+    assert not errout
+
+    status = pipe.returncode
+
+    return (status, output)
+
+def get_status_output_errors(cmd, input=None, cwd=None, env=None):
+    pipe = sp.Popen(cmd, shell=True, cwd=cwd, env=env, stdout=sp.PIPE, stderr=sp.PIPE)
+
+    (output, errout) = pipe.communicate(input=input)
+
+    status = pipe.returncode
+
+    return (status, output, errout)
+
+def get_output(cmd, input=None, cwd=None, env=None):
+    return get_status_output(cmd, input, cwd, env)[1]
+
+try:
+    opts, args = getopt.getopt(argv[1:],"hntN")
+except getopt.GetoptError as err:
+    print(str(err))
+    print('Usage: freen \n\t[-n    display nodelist]\n\t[-N    single node]')
+    sys.exit()
+n = t = grand_total_idle_n = grand_total_n = grand_total_idle_c = grand_total_c = 0
+#sinfo_cmd = check_output(['which sinfo']).rstrip("\n") # nope
+cmd = '/usr/bin/sinfo --exact -h -o "%N\t%F\t%P\t%C\t%c\t%m\t%f\t%X\t%Y" '
+for opt,arg in opts:
+    if opt == '-h':
+        print('Usage: freen \n\t[-n    display nodelist]\n\t[-N    single node]')
+        sys.exit()
+    elif opt == '-n':
+        n = 1
+    elif opt == '-t':
+        t = 1
+    elif opt == '-N':
+        Node = os.getenv('SLURMD_NODENAME')
+        if Node:
+            if ('cn' in Node): 
+                print("\n> Node %s <" % Node)
+                cmd += " -N -n %s" % Node
+#cmd += " | grep -v drained | grep -v interactive | grep -v centos7"
+cmd += " | grep -v drained | grep -v centos7"
+#out = commands.getoutput(cmd)
+out = get_output([cmd]).decode('utf-8')
+print('\n                                                  ........Per-Node Resources.........')
+if n == 1: 
+        print('Partition          FreeNds       FreeCPUs      Cores CPUs   Mem    Disk    Features                                            Nodelist')
+        print("---------------------------------------------------------------------------------------------------------------------------------------")
+else:
+        print('Partition           FreeNds       FreeCPUs        Cores CPUs   Mem   Disk    Features')
+        print("-------------------------------------------------------------------------------------")
+for line in out.split('\n'):
+        #(nodelist, alloc_idle_n, partition, alloc_idle_c, cpus,memory, features,sockets,cps) = line.split('\t')
+        tmp = line.split('\t')
+        if len(tmp) != 9: continue
+        (nodelist, alloc_idle_n, partition, alloc_idle_c, cpus,memory, features,sockets,cps) = tmp
+        (alloc_n, idle_n,other_n,total_n) = alloc_idle_n.split('/')
+        partition = partition.strip()
+        if (partition != "quick") and (partition != "maint"):
+                grand_total_idle_n += int(idle_n)
+                grand_total_n += int(total_n) - int(other_n)
+        freen = "%s/%-s" %(idle_n.strip(),int(total_n.strip()) - int(other_n.strip()))
+        (alloc_c, idle_c,other_c,total_c) = alloc_idle_c.split('/')
+        if (partition != "quick") and (partition != "maint"):
+                grand_total_idle_c += int(idle_c)
+                grand_total_c += int(total_c) - int(other_c)
+        freec = "%s/%-s" %(idle_c.strip(),int(total_c.strip()) - int(other_c.strip()))
+        cores = int(sockets) * int(cps);
+        disk = 800
+        if 'sata100' in (features):
+                disk = 100
+        elif 'sata200' in (features):
+                disk = 200
+        elif 'sata400' in (features):
+                disk = 400
+        elif 'ssd400' in (features):
+                disk = 400
+        elif 'sata600' in (features):
+                disk = 600
+        # removed list of nodes from the output 1/21/15
+        if n == 1:
+             print("%-18s  %-12s %-15s  %3s   %3s  %5dg  %4dg   %-45s   %-20s" %(partition,freen,freec,cores,cpus,int(int(memory)/1024),disk,features, nodelist))
+        else:
+             print("%-18s  %-12s %-15s  %3s   %3s  %5dg  %4dg   %-25s" %(partition,freen,freec,cores,cpus,int(int(memory)/1024),disk,features))
+
+print("")
+if t == 1:
+        print("--------------------------------------------------------------")
+        print("Total free   %4i/%-4i (%2i%%) nodes, " %(grand_total_idle_n, grand_total_n, int(100*grand_total_idle_n/grand_total_n)), end=' ')
+        print("%5i/%-5i (%2i%%) cores, " %(grand_total_idle_c/2,grand_total_c/2,int(100*grand_total_idle_c/grand_total_c)), end=' ')
+        print("%5i/%-5i (%2i%%) CPUs" %(grand_total_idle_c, grand_total_c,int(100*grand_total_idle_c/grand_total_c)))
+        print("Total alloc. %4i/%-4i (%2i%%) nodes, " %(grand_total_n - grand_total_idle_n, grand_total_n, int(100*(grand_total_n - grand_total_idle_n)/grand_total_n)), end=' ')
+        print("%5i/%-5i (%2i%%) cores, " %((grand_total_c - grand_total_idle_c)/2, grand_total_c/2, int(100*(grand_total_c - grand_total_idle_c)/grand_total_c)), end=' ')
+        print("%5i/%-5i (%2i%%) CPUs" %(grand_total_c - grand_total_idle_c, grand_total_c, int(100*(grand_total_c - grand_total_idle_c)/grand_total_c)))
+
+
+
+        

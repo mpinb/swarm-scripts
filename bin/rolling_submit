@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+
+# This is a wrapper/utility for swarm/aswarm that polls sjobs to submit new swarms
+#   after a threshold of queued/running is reached. This circumvents any maxsubmit
+#   limits, and only requires that swarms are divided into chunks that stay under
+#   the slurm array jobs limit of 1000. For polling, the script should be run in
+#   the background with the output piped (and using nohup or similar).
+# The script also creates subdirs for all the logs files, and copies a text file into
+#   the subdir that contians the job id of the submission, which is useful for later
+#   jobhist queries.
+
+# array of swarms to submit, can define with wildcards
+swarms=()
+
+# when total of queued and running jobs is less than this, submit next swarm
+njob_cutoff=1000000
+
+# polling time in seconds, for really long jobs, recommend 10 mins or more
+sleep_time=600
+
+# which swarm command to use and the other options (besides swarm file)
+swarm_cmd=aswarm
+swarm_opts=
+
+# which partition to query jobs for
+# leave undefined for not specified (queries all partitions)
+#p_sjobs=
+
+# specify different values for jobs packed per node
+# leave undefined to not use (instead defined in swarm_opts)
+#nprocs=
+
+# to run but not actually execute the swarm commands, for debug / test submissions.
+# leave undefined to execute the submission commands.
+#no_run=
+
+# if the swarm subdirectory already exists, forcibly remove and continue.
+# if force is not specified, exit with error message
+#force=
+
+#cnt=0
+for var in "$@"; do
+    if [ "$get_swarms" == "true" ]; then
+        swarms=($var)
+        get_swarms=false
+    elif [ "$get_job_cutoff" == "true" ]; then
+        njob_cutoff=$var
+        get_job_cutoff=false
+    elif [ "$get_sleep_time" == "true" ]; then
+        sleep_time=$var
+        get_sleep_time=false
+    elif [ "$get_swarm_cmd" == "true" ]; then
+        swarm_cmd=$var
+        get_swarm_cmd=false
+    elif [ "$get_swarm_opts" == "true" ]; then
+        swarm_opts=$var
+        get_swarm_opts=false
+    elif [ "$get_p_sjobs" == "true" ]; then
+        p_sjobs=$var
+        get_p_sjobs=false
+    elif [ "$get_nprocs" == "true" ]; then
+        nprocs=($var)
+        get_nprocs=false
+    fi
+
+    if [ "$var" == "--swarms" ]; then
+        get_swarms=true
+    elif [ "$var" == "--njob_cutoff" ]; then
+        get_job_cutoff=true
+    elif [ "$var" == "--sleep_time" ]; then
+        get_sleep_time=true
+    elif [ "$var" == "--swarm_cmd" ]; then
+        get_swarm_cmd=true
+    elif [ "$var" == "--swarm_opts" ]; then
+        get_swarm_opts=true
+    elif [ "$var" == "--p_sjobs" ]; then
+        get_p_sjobs=true
+    elif [ "$var" == "--nprocs" ]; then
+        get_nprocs=true
+    elif [ "$var" == "--no-run" ]; then
+        no_run=true
+    elif [ "$var" == "--force" ]; then
+        force=true
+    fi
+
+    #cnt=$((cnt+1))
+done
+
+echo "Specified options:"
+echo ${#swarms[@]} swarms to submit:
+echo ${swarms[*]}
+echo nprocs to submit:
+echo ${nprocs[*]}
+echo "njob_cutoff: ${njob_cutoff}"
+echo "sleep_time: ${sleep_time}"
+echo "swarm_cmd: ${swarm_cmd}"
+echo "swarm_opts: ${swarm_opts}"
+echo "p_sjobs: ${p_sjobs}"
+echo "no-run: ${no_run}"
+echo "force: ${force}"
+echo
+
+if [ ${#swarms[@]} -eq 0 ]; then
+    echo "no swarms specified"
+fi
+if [ ${#swarms[@]} -eq 0 ] || [ -z ${njob_cutoff} ] || [ -z ${sleep_time} ] || [ -z ${swarm_cmd} ]; then
+    echo "some required args missing"
+    echo "USAGE: rolling_submit"
+    echo "  required:"
+    echo "  --swarms <str> ...    names of swarms to submit or '' enclosed wildcard"
+    echo "  optional (with defaults):"
+    echo "  --swarm_opts <str>    quote enclosed options to send to swarm command, default empty"
+    echo "  --swarm_cmd <str>     should be swarm or aswarm, default aswarm"
+    echo "  --njob_cutoff <int>   running/queued njobs cutoff to submit next swarm, default 1e6"
+    echo "  --sleep_time <int>    how long to wait (secs) before polling jobs again, default 600"
+    echo "  optional (default is off):"
+    echo "  --p_sjobs <str>       which patition to *query* for jobs"
+    echo "  --nprocs <int> ...    parallel to swarms, pack n jobs per node"
+    echo "  --no-run              do no actually submit anything, for debug/verify"
+    echo "  --force               if the swarm subdirs already exist, remove/remake"
+    echo "run in background using for example:"
+    echo "  nohup <rolling_submit_cmd> >& rolling_submit_out.txt &"
+    echo
+    aswarm
+    exit
+fi
+
+# if partition specified, add the -p flag for sjobs
+if [ -n "$p_sjobs" ]; then
+    p_sjobs="-p $p_sjobs"
+fi
+
+for i in ${!swarms[@]}; do
+   # https://stackoverflow.com/questions/16489809/emulating-a-do-while-loop-in-bash
+   while
+      ntotal=$(sjobs ${p_sjobs} 2>&1 | tail -2 | awk '{s+=$4} END {print s}')
+      echo $ntotal jobs running or submitted $(date)
+      (( ntotal > njob_cutoff ))
+   do
+      sleep ${sleep_time}
+   done
+
+   # put log files into separate dirs
+   subdir=_${swarms[$i]}
+   if [[ -d ${subdir} ]]; then
+       if [ -z "$force" ]; then
+           echo "'${subdir}' exists and force not specified"
+           exit
+       else
+           rm -rf ${subdir}
+       fi
+   fi
+   if [ -z "$no_run" ]; then
+       mkdir ${subdir}
+       cp ${swarms[$i]} ${subdir}
+       cd ${subdir}
+   fi
+
+   # capture the submitted job_id
+   if [ -z "$nprocs" ]; then
+      cmd="$swarm_cmd -f ${swarms[$i]} $swarm_opts"
+   else
+      cmd="$swarm_cmd -f ${swarms[$i]} $swarm_opts -p ${nprocs[$i]}"
+   fi
+   echo $cmd
+   echo
+   if [ -z "$no_run" ]; then
+      job_id=$(eval ${cmd})
+   fi
+   echo $job_id
+
+   if [ -z "$no_run" ]; then
+       # write the job_id into a file for reference
+       job_id=$(echo $job_id | grep -Eo '[0-9]+$')
+       echo $job_id > job_id.txt
+       cd ..
+   fi
+done

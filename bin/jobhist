@@ -1,0 +1,549 @@
+#!/usr/bin/env python
+
+"""
+jobhist - A script that will output historical information about users' jobs on
+          the cluster.  It depends on /usr/local/logs/sbatch.log,
+          /usr/local/logs/swarm.log, and the sacct SLURM command.
+"""
+
+import argparse
+import subprocess
+import shlex
+import os.path
+import datetime as dt
+import sys
+import re
+import textwrap
+from collections import namedtuple
+from dateutil.parser import parse
+from operator import itemgetter
+import numpy as np
+
+#sys.path.insert(0, "/usr/local/pyslurm/latest/lib64/python2.6/site-packages")
+#import pyslurm
+
+__author__ = "Susan Chacko and Giovanni Torres"
+__date__ = "Mon Mar 16 10:53:27 EDT 2015"
+
+# check if running as root -- effective UID is 0
+effective_uid = os.geteuid()
+# get the username of the person running this process
+proc_owner=os.environ.get('USER')
+#home_dir=os.environ.get('HOME')
+swarm_dir=os.environ.get('SWARMDIR')
+LINEFORMAT = "{0:<12}{1:>10}{2:>12}{3:>7}{4:>6}{5:>14}{6:>14}{7:>15}{8:>9}  {9}"
+#LOGDIR = os.path.join(swarm_dir,"swarm","logs")
+LOGDIR = os.path.join(swarm_dir,"logs")
+SBATCHLOGFILE = "sbatch.log"
+SBATCHARCHIVEDIR = os.path.join(LOGDIR, "sbatch_log_archives")
+SWARMLOGFILE = "swarm.log"
+SWARMARCHIVEDIR = os.path.join(LOGDIR, "swarm_log_archives")
+
+
+def print_header():
+    """Print header for the sacct portion of the output."""
+    print("")
+    print(LINEFORMAT.format("Jobid",
+                            "Partition",
+                            "State",
+                            "Nodes",
+                            "CPUs",
+                            "Walltime",
+                            "Runtime",
+                            "MemReq",
+                            "MemUsed",
+                            "Nodelist"))
+
+
+def reformat_memreq(memreq):
+    """
+    Return requested memory in string format, converting memory value to GB:
+
+    "c" => "/cpu"
+    "n" => "/node"
+
+    """
+    if memreq.endswith("c"):
+        memreq_unit = "GB/cpu"
+        memreq = memreq[:-1]
+
+    #if memreq.endswith("n"):
+    else:
+        memreq_unit = "GB/node"
+        if memreq.endswith("n"):
+            memreq = memreq[:-1]
+
+    if memreq.endswith("K"):
+        memreq =  float(memreq[:-1]) / (1024 * 1024)
+    elif memreq.endswith("M"):
+        memreq =  float(memreq[:-1]) / 1024
+    elif memreq.endswith("G"):
+        memreq =  float(memreq[:-1])
+    elif memreq.endswith("T"):
+        memreq =  float(memreq[:-1]) * 1024
+
+    memreq = "%4.1f" % memreq
+    return  str(memreq) + memreq_unit
+
+
+def reformat_memused(memused):
+    """Return used memory in GB as a string, with one decimal place."""
+    if memused == '':
+        return "-"
+    elif memused.endswith("K"):
+        memused =  float(memused[:-1]) / (1024 * 1024)
+    elif memused.endswith("M"):
+        memused =  float(memused[:-1]) / 1024
+    elif memused.endswith("G"):
+        memused =  float(memused[:-1])
+    else:
+        memused = 0.0
+
+    return str("%.1f" % memused) + "GB"
+
+
+def find_log_file(submittime, logtype):
+    """
+    Return path to sbatch/swarm log file.
+
+    If today is in the same week as the submit time of a given job, use
+    /usr/local/logs/{sbatch,swarm}.log.
+
+    If submit time is not in the current week, use the rotated sbatch/swarm log
+    file from /usr/local/{sbatch,swarm}_log_archives.
+
+    Note:
+        woy == week of year
+
+    """
+    try:
+        submitted = parse(submittime).date()
+        submitted_woy = submitted.strftime("%U")
+    except ValueError:
+        return None
+
+    if logtype == "swarm":
+        logfile = SWARMLOGFILE
+        archivedir = SWARMARCHIVEDIR
+    elif logtype == "sbatch":
+        logfile = SBATCHLOGFILE
+        archivedir = SBATCHARCHIVEDIR
+    else:
+        return None
+
+    #today = dt.date.today()
+    #today_woy = today.strftime("%U")
+
+    #if submitted_woy == today_woy:
+    #    return os.path.join(LOGDIR, logfile)
+    return os.path.join(LOGDIR, logfile)
+
+    logfiledate = dt.datetime.strptime(
+        str(submitted.year) +"-W" + submitted_woy + "-0", "%Y-W%W-%w"
+    ).date()
+
+    logdateext = str(logfiledate.year) + \
+                 str(logfiledate.month).zfill(2) + \
+                 str(logfiledate.day).zfill(2)
+
+    dated_logfile = logfile + "-" + logdateext
+    return os.path.join(archivedir, dated_logfile)
+
+
+def find_job_in_log(jobid, submittime, logtype):
+    """
+    Return matching line from {sbatch,swarm}.log for a given jobid. If no match
+    is found, return None.
+    """
+    # try:
+    #     pass
+    #     # xxx - does not work, not sure why, do not care, use logs only
+    #     #jobinfo = pyslurm.job().find_id(jobid)[0]
+    #     #array_job_id = jobinfo.get('array_job_id')
+    #     #if array_job_id is not None:
+    #     #    jobid = array_job_id
+    # except:
+    #     #pass
+    #     jobinfo = ''
+
+    if logtype == "swarm":
+        search_string = "jobid=" + str(jobid)
+        logfile = find_log_file(submittime, "swarm")
+    elif logtype == "sbatch":
+        search_string = "SUBM[" + str(jobid) + "]"
+        logfile = find_log_file(submittime, "sbatch")
+
+    if logfile is not None and os.path.isfile(logfile):
+        with open(logfile, 'r') as log:
+            for line in log:
+                if search_string in line:
+                    return line
+    else:
+        return None
+
+
+def display_wrapped(label, value):
+    wrapped = textwrap.wrap(value, 68)
+    print("{0:<19}: {1}".format(label, wrapped[0]))
+    if len(wrapped) > 1:
+        for item in wrapped[1:]:
+            print("{0:21}{1}".format("", item))
+
+
+def display_jobhist_sbatchlog(jobid, line, jobinfo):
+    """
+    Print jobhist information from the sbatch/swarm log. If line could not be
+    found, don't print anything.
+    """
+    if line is None:
+        return
+
+    # parse the output and print
+    #date, time, host, job, user, directory, com = line.split(' ', 6)
+    tmp = line.split(';', 6)
+    date, time, host, job, user, directory, com = [x.strip() for x in tmp]
+
+    # exit if the user is not the person running jobhist
+    if effective_uid != 0 and proc_owner != user:
+        print("*** ERROR: you can only use jobhist to examine your own jobs")
+        sys.exit()
+
+
+    # replace /spin1/users or /gpfs/gsfs*/users with /data/   - Susan, May 2017
+    directory = re.sub('/spin1/users/', '/data/', directory)
+    directory = re.sub(r'/gpfs/gsfs./users/', '/data/',  directory)
+
+    # Swarm gives its created job script a random-string name at first. When
+    # the job is submitted, a symlink is created that points to the temporary
+    # directory. Print the jobid path instead ot the tmp path.
+
+    # First check if this is a swarm job (script contains
+    # /spin1/swarm/
+    batchscript = com.split(' ')[-1]
+
+    #if '/spin1/swarm' in batchscript and not os.path.isfile(batchscript):
+    if '/swarm' in batchscript and not os.path.isfile(batchscript):
+        # change the reported tmp directory to jobid/swarm.batch
+        string = batchscript.rsplit('/', 2)[0]
+        batchscript = string + "/" +  str(jobid) + "/swarm.batch"
+        com = com.rsplit(' ',1)[0] + " " + batchscript
+        swarm = True
+    else:
+        #swarm = False
+        swarm = True # xxx - only swarm
+
+    end_time = None
+
+    if jobinfo:
+        end_time = max(job.End for job in jobinfo)
+        end_time = end_time.replace("-", "").replace("T", " ")
+        start_time = max(job.Start for job in jobinfo)
+        start_time = start_time.replace("-", "").replace("T", " ")
+
+    print("")
+    print("JobId              : %s" % jobid)
+    print("User               : %s" % user)
+    print("Submitted          : %s %s" % (date, time))
+
+    # Only print Started if job has started
+    if start_time is not None and start_time != "Unknown":
+        print("Started            : %s" % start_time)
+
+    # Only print Ended if job has ended
+    if end_time is not None and end_time != "Unknown":
+        print("Ended              : %s" % end_time)
+
+    display_wrapped("Submission Path", directory)
+    display_wrapped("Submission Command", com)
+
+    if swarm:
+        display_jobhist_swarmlog(jobid, jobinfo)
+
+
+def display_jobhist_swarmlog(jobid, jobinfo):
+    """
+    """
+    if jobinfo:
+        submittime = jobinfo[0].Submit
+        swarmline = find_job_in_log(jobid, submittime, "swarm")
+        if swarmline is not None:
+            kv = dict((val.strip().split("=", 1)[0],
+                       val.strip().split("=", 1)[1])
+                      for val in swarmline.split(";"))
+            display_wrapped("Swarm Path", kv.get("pwd", ""))
+            display_wrapped("Swarm Command", kv.get("command", ""))
+
+
+def call_sacct(jobid):
+    """
+    Return a list of sacct lines related to a given jobid and also a dictionary
+    or any of the previous lines that include "batch".
+    """
+
+    jobinfo = []
+    jobinfo_batch = {}
+
+    fields = "JobID,Partition,NNodes,AllocCPUs,ReqCPUs,Timelimit,Elapsed,ReqMem,MaxRSS,NodeList,State,Submit,Start,End"
+
+    # get info from sacct
+    sacct_output = subprocess.Popen(['sacct', '-PnD', '-j', str(jobid),
+                                    '--format', fields],
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    encoding='utf8').communicate()
+    #print(' '.join(['sacct', '-Pn', '-j', str(jobid), '--format', fields]))
+    #print (sacct_output)
+
+    stdout = sacct_output[0].strip().split('\n')
+    stderr = sacct_output[1].strip().split('\n')
+
+    if stderr != ['']:
+        print(stderr)
+        return
+
+    # if the job is not found in sacct, print an error and go to the next job
+    if stdout == ['']:
+        print("No accounting data for this job")
+        return jobinfo, jobinfo_batch
+
+    # Create namedtuple to access each field by name instead of index num
+    JobLine = namedtuple('JobLine', fields.split(","))
+
+    # shortcut to get all fields
+    g = itemgetter(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,13)
+
+    # The * unpacks the tuple before passing as argument to the namedtuple
+    # function; this creates new list of only the lines where the partition is
+    # set
+    jobinfo = [JobLine(*g(line.split("|")))
+               for line in stdout
+               if line.split("|")[1] != '']
+
+    jobinfo_batch = dict((line.split("|")[0][:-6],
+                          JobLine(*g(line.split("|"))))
+                          for line in stdout
+                          if ".batch" in line.split("|")[0])
+
+    return jobinfo, jobinfo_batch
+
+
+def display_jobhist_sacct(jobinfo, jobinfo_batch):
+    """ Print jobhist information from sacct. """
+
+    print_header()
+
+    try:
+        jobinfo.sort(key=lambda x: list(map(int, x.JobID.split('_'))), reverse=False)
+    except:
+        pass
+    njobs = len(jobinfo)
+    all_times = np.zeros((njobs,), dtype=np.double)
+    all_mems = np.zeros((njobs,), dtype=np.double)
+    for job,ijob in zip(jobinfo, range(njobs)):
+        jobbatch = jobinfo_batch.get(job.JobID)
+
+        if jobbatch:
+            maxrss= jobbatch.MaxRSS
+        else:
+            maxrss = job.MaxRSS
+
+        if job.NodeList == "None assigned":
+            nnodes = "--"
+            ncpus = job.ReqCPUs
+        else:
+            nnodes = job.NNodes
+            ncpus = job.AllocCPUs
+
+        time_str = job.Elapsed.split(':')
+        try:
+            all_times[ijob] = int(time_str[0])*60*60 + int(time_str[1])*60 + int(time_str[2])
+        except:
+            time_str2 = time_str[0].split('-')
+            all_times[ijob] = int(time_str2[0])*24*60*60 + int(time_str2[1])*60*60 + int(time_str[1])*60 \
+                    + int(time_str[2])
+        try:
+            all_mems[ijob] = float(reformat_memused(maxrss)[:-2])
+        except:
+            all_mems[ijob] = np.nan
+
+        print(LINEFORMAT.format(job.JobID,
+                                job.Partition,
+                                job.State.split()[0],
+                                nnodes,
+                                ncpus,
+                                job.Timelimit,
+                                job.Elapsed,
+                                reformat_memreq(job.ReqMem),
+                                reformat_memused(maxrss),
+                                job.NodeList))
+    print("")
+
+    if not np.isfinite(all_mems).any(): all_mems[0] = 0
+    tstat = all_times.mean(); mstat = np.nanmean(all_mems)
+    print('Mean over %d jobs: time %7d s or %7.1f m or %4.3f h, mem %5.1fGB' % \
+        (njobs, tstat, tstat/60, tstat/3600, mstat))
+    tstat = all_times.max(); mstat = np.nanmax(all_mems)
+    print('Max  over %d jobs: time %7d s or %7.1f m or %4.3f h, mem %5.1fGB' % \
+        (njobs, tstat, tstat/60, tstat/3600, mstat))
+    tstat = all_times.min(); mstat = np.nanmin(all_mems)
+    print('Min  over %d jobs: time %7d s or %7.1f m or %4.3f h, mem %5.1fGB' % \
+        (njobs, tstat, tstat/60, tstat/3600, mstat))
+    tstat = np.median(all_times); mstat = np.nanmedian(all_mems)
+    print('Med  over %d jobs: time %7d s or %7.1f m or %4.3f h, mem %5.1fGB' % \
+        (njobs, tstat, tstat/60, tstat/3600, mstat))
+    tstat = np.sum(all_times); mstat = np.nansum(all_mems)
+    print('Sum  over %d jobs: time %7d s or %7.1f m or %4.3f h, mem %5.1fGB' % \
+        (njobs, tstat, tstat/60, tstat/3600, mstat))
+
+def concatenate_subfiles(top_dir, fn):
+    bn, ext = os.path.splitext(top_dir)
+    full_top_dir = format(os.path.join(os.getcwd(), top_dir))
+    args = shlex.split("find {} -wholename {}".format(full_top_dir,
+            os.path.join(full_top_dir, bn + '.*', fn)))
+    find = subprocess.Popen(args, stdout=subprocess.PIPE)
+    jobhist_files = []
+    for line in find.stdout:
+        cline = line.decode().strip()
+        if not cline: continue
+        jobhist_files += [cline]
+    find.communicate()
+    jobhist_files.sort()
+    jobhist_txt = os.path.join(top_dir, fn)
+    with open(jobhist_txt, 'w') as jh:
+        for jobhist_file in jobhist_files:
+            with open(jobhist_file, 'r') as cjh:
+                jh.write(cjh.read())
+    return jobhist_txt
+
+def grep_jobhist(fn, fnstr):
+    #fields = [9,15] # time in minutes, memory
+    fields = [9,]
+    for field in fields:
+        print()
+        print("grep Max {} | awk '{{print ${};}}' | sort -n | tail".format(fnstr, field))
+        args = shlex.split("grep Max {}".format(fn))
+        grep = subprocess.Popen(args, stdout=subprocess.PIPE)
+        args = ['awk', '{{print ${};}}'.format(field)]
+        awk = subprocess.Popen(args, stdin=grep.stdout, stdout=subprocess.PIPE)
+        grep.stdout.close()
+        args = ['sort', '-n']
+        cmd_sort = subprocess.Popen(args, stdin=awk.stdout, stdout=subprocess.PIPE)
+        awk.stdout.close()
+        args = ['tail']
+        tail = subprocess.Popen(args, stdin=cmd_sort.stdout)
+        cmd_sort.stdout.close(); tail.wait()
+
+    print()
+    print("grep FAILED {}".format(fnstr))
+    args = shlex.split("grep FAILED {}".format(fn))
+    grep = subprocess.Popen(args); grep.wait()
+    print("grep TIME {}".format(fnstr))
+    args = shlex.split("grep TIME {}".format(fn))
+    grep = subprocess.Popen(args); grep.wait()
+    print("grep MEM {}".format(fnstr))
+    args = shlex.split("grep MEM {}".format(fn))
+    grep = subprocess.Popen(args); grep.wait()
+    print("grep COMPL {} | wc -l".format(fnstr))
+    args = shlex.split("grep COMPL {}".format(fn))
+    grep = subprocess.Popen(args, stdout=subprocess.PIPE)
+    args = ['wc', '-l']
+    wc = subprocess.Popen(args, stdin=grep.stdout, stdout=subprocess.PIPE)
+    grep.stdout.close()
+    print(int(wc.communicate()[0]))
+
+
+if __name__ == '__main__':
+    description = """Print information about completed jobs.
+
+Note: RUNNING jobs will not show MemUsed"""
+    parser = argparse.ArgumentParser(description=description,
+                                     formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument('jobids', metavar='JobId', nargs='+', help='job number')
+    args = parser.parse_args()
+
+    try:
+        ijobids = [int(x) for x in args.jobids]
+        ijobids = True
+    except:
+        ijobids = False
+
+    if ijobids:
+        for jobid in args.jobids:
+            # Call sacct to get submit time of each job
+            jinfo, jinfo_batch = call_sacct(jobid)
+            if jinfo:
+                submittime = jinfo[0].Submit
+                # Find log line in sbatch.log.
+                # This will also check if job is a swarm and print swarm info.
+                sbatchlogline = find_job_in_log(jobid, submittime, "sbatch")
+                # Display job info from sbatch [and swarm] logfile(s).
+                display_jobhist_sbatchlog(jobid, sbatchlogline, jinfo)
+                if not sbatchlogline:
+                    # Display job info from swarm incase of no sbatch.log
+                    display_jobhist_swarmlog(jobid, jinfo)
+                # Display job info from sacct
+                display_jobhist_sacct(jinfo, jinfo_batch)
+            else:
+                # If we can't find a job in any of the logs,
+                # try at least this week's log
+                submittime = dt.datetime.today().isoformat()
+                sbatchlogline = find_job_in_log(jobid, submittime, "sbatch")
+                display_jobhist_sbatchlog(jobid, sbatchlogline, jinfo)
+    else: # if ijobids
+        jobhist_fnstr = 'jobhist.txt'
+        incomplete_fnstr = 'jobhist-incomplete.txt'
+        top_dir = args.jobids[0]
+        # added a new mode that recurses directory looking for job_id.txt (from rolling_submit)
+        #   and if it's found, runs jobhist for that jobid and saves in the same directory
+        #   but only if all the jobs are not running or pending.
+        assert( len(args.jobids) == 1 and os.path.isdir(top_dir) ) # must specify existing subdir
+        args = shlex.split("find {} -name job_id.txt".format(top_dir))
+        find = subprocess.Popen(args, stdout = subprocess.PIPE)
+        for line in find.stdout:
+            job_id_txt = line.decode().strip()
+            if not job_id_txt: continue # just in case of blank lines
+            job_id_path = os.path.dirname(job_id_txt)
+            jobhist_txt = os.path.join(job_id_path, jobhist_fnstr)
+            incomplete_txt = os.path.join(job_id_path, incomplete_fnstr)
+            if not os.path.isfile(jobhist_txt):
+                with open(job_id_txt, 'r') as jf:
+                    for jline in jf:
+                        cjline = jline.strip()
+                        if cjline:
+                            job_id = int(cjline)
+                            print(job_id_txt)
+                            print('\tjobid = {}'.format(job_id))
+                            args = shlex.split("{} {} {}".format(sys.executable, __file__, job_id))
+                            with open(jobhist_txt, 'w') as jh:
+                                jobhist = subprocess.Popen(args, stdout=jh, stderr=jh)
+                                jobhist.wait()
+                            args = ['grep', '-E', 'RUNNING|PENDING', jobhist_txt]
+                            grep = subprocess.Popen(args, stdout=subprocess.PIPE)
+                            output = grep.communicate()[0]
+                            if output.decode().strip():
+                                #print('not finished, remove ' + jobhist_txt)
+                                #os.remove(jobhist_txt)
+                                # instead of removing, move to a different "incomplete" file, this way a better
+                                #   complete count can be estimated whilst jobs sets are still running.
+                                os.replace(jobhist_txt, incomplete_txt)
+                            elif os.path.isfile(incomplete_txt):
+                                os.remove(incomplete_txt)
+            #if not os.path.isfile(jobhist_txt):
+        #for line in find.stdout:
+        find.communicate()
+
+        # these are for convenience, most typically cat the jobhists for jobs from mrolling_submit
+        #   and then grep for any failures and for max runtimes.
+        if os.path.isfile(os.path.join(top_dir, '_' + top_dir)):
+            # jobhist was called on a single mrolling_submit top dir
+
+            # concatenate all the jobhist and incomplete jobhist files from the mrolling_submit
+            #   subdirectories into a giant jobhist files at the top level.
+            jobhist_txt = concatenate_subfiles(top_dir, jobhist_fnstr)
+            incomplete_txt = concatenate_subfiles(top_dir, incomplete_fnstr)
+
+            # grep and print useful information out of giant jobhist files
+            grep_jobhist(jobhist_txt, jobhist_fnstr)
+            grep_jobhist(incomplete_txt, incomplete_fnstr)
+        #if os.path.isfile(os.path.join(top_dir, '_' + top_dir)):
+    #else: # if ijobids

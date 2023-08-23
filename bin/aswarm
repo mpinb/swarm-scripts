@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+
+# This is a wrapper for swarm that automatically calculates threads and memory
+#   depending on the processes packed per node and which partition.
+
+# for exclude lists, just resource each time so this does not have to be done manually.
+FILE=/gpfs/soma_fs/cne/.slurm && test -f $FILE && source $FILE
+
+function join_by { local IFS="$1"; shift; echo "$*"; }
+
+srunning() {
+sacct --user $(whoami) -X -b -s RUNNING | awk '{print $1}' | cut -d'_' -f1 | tr -d "[:blank:]" | tail -n+3 | sort | uniq
+}
+spending() {
+squeue --user $(whoami) --format '%A' --states PENDING | awk '{print $1;}' | tail -n+2 | sort | uniq
+}
+
+# automatically create dictionaries of memory / num cpus keyed by each partition name
+declare -A ncpus memory gres
+maxmem=0
+maxcpu=0
+my_cmd='sinfo --exact -h -o "%R %c %m %G"'
+lines=$(eval ${my_cmd})
+while IFS= read -r line; do
+    read -ra fields <<< "$line"
+    ncpus[${fields[0]}]=${fields[1]}
+    if [ ${fields[1]} -gt $maxcpu ]; then
+      maxcpu=${fields[1]}
+    fi
+    memory[${fields[0]}]=${fields[2]}
+    if [ ${fields[2]} -gt $maxmem ]; then
+      maxmem=${fields[2]}
+    fi
+    gres[${fields[0]}]=${fields[3]}
+done <<< "$lines"
+# xxx - could not figure out an easy way to get default CPU/GPU partitions
+hostname=$(hostname)
+if [[ ${hostname} == soma* ]]; then
+    p_cpu=CPU; p_gpu=GPU; ngpu=4
+elif [[ ${hostname} == axon* ]]; then
+    p_cpu=p.axon; p_gpu=p.gpu; ngpu=1
+fi
+# xxx - started on a generic way to read in number of gpus
+#   decided it was not worth it right now, since we still have the cluster-specific switch anyways
+# IFS=':' read -ra GRES <<< "${gres[${p_gpu}]}"
+# for j in ${!GRES[@]}; do
+#   if [ "${GRES[$j]}" == "gpu" ]; then
+#   fi
+# done
+
+# flags that are basically always kept the same, so added to the swarm command
+fixed_params="--verbose 2 --check-msg"
+default_time="--time 24:00:00"
+
+cnt=0
+nonexclusive=
+exclusive=
+have_time=
+nprocs_in=1
+nbundle=1
+for var in "$@"; do
+    if [ "$get_partition" == "true" ]; then
+        partition_in=$var
+        get_partition=false
+    elif [ "$get_nprocs" == "true" ]; then
+        nprocs_in=$var
+        get_nprocs=false
+        if [ -n "$nonexclusive" ]; then
+            var=1
+        fi
+    elif [ "$get_nbundle" == "true" ]; then
+        nbundle=$var
+        get_nbundle=false
+    fi
+    if [ "$var" == "--partition" ]; then
+        get_partition=true
+    elif [ "$var" == "-p" ]; then
+        get_nprocs=true
+    elif [ "$var" == "-b" ]; then
+        get_nbundle=true
+    elif [ "$var" == "-pt" ]; then
+        get_nprocs=true
+        var=-p
+        nonexclusive=true
+    elif [ "$var" == "--time" ]; then
+        have_time=true
+    elif [ "$var" == "--exclusive" ]; then
+        exclusive=true
+    fi
+    if [[ $var =~ " " ]]; then
+        # the single quotes from the original command line get lost,
+        #   so if there are spaces in the arg then put the single quotes back.
+        all_args=(${all_args[@]} "'$var'")
+    else
+        all_args=(${all_args[@]} "$var")
+    fi
+    cnt=$((cnt+1))
+done
+
+if [[ -n "$nonexclusive" && -n "$exclusive" ]]; then
+  echo "specifying both -pt (slurm packing) and --exclusive is not allowed"
+  exit
+fi
+
+IFS=',' read -ra partitions <<< "$partition_in"
+#if [ ${#partitions[@]} -gt 1 ]; then
+#  if [[ -z "$nonexclusive" || -n "$exclusive" ]]; then
+#    echo "multiple partitions only allowed with -pt (slurm packing) and without exclusive"
+#    exit
+#  fi
+#fi
+
+IFS=',' read -ra nprocs <<< "$nprocs_in"
+
+unset invalid_partition
+if [[ -z "$partition_in" ]]; then
+  invalid_partition=none
+else
+  for j in ${!partitions[@]}; do
+    if [[ -z ${ncpus[${partitions[$j]}]} ]]; then
+      invalid_partition=${partitions[$j]}
+    fi
+  done
+fi
+if [[ -n "$invalid_partition" ]]; then
+    last_job=$(spending | tail -n 1)
+    if [ -z "$last_job" ]; then
+        last_job=$(srunning | tail -n 1)
+    fi
+    if [ -n "$last_job" ]; then
+      dep_str="--dependency=afterany:${last_job}"
+    else
+      # default to a placeholder
+      dep_str="--dependency=afterany:1"
+    fi
+    echo "bad partition '$invalid_partition' specified"
+    echo "USAGE: aswarm -f xxx"
+    echo " --partition ${p_cpu} --sbatch ' --exclude=$SLURM_EXCLUDES_CPU $dep_str ' -p xx"
+    echo " --partition ${p_gpu} --sbatch ' --exclude=$SLURM_EXCLUDES_GPU --gres=gpu:$ngpu $dep_str ' -p xx"
+    echo " use --no-run to test without submitting"
+    echo " use -pt instead of -p to let slurm do the packing"
+    echo " use -b instead of -p to run this number of jobs serially per node (swarm bundle)"
+    exit
+fi
+
+if [ -n "$exclusive" ]; then
+  partition=${partitions[0]}
+  all_args=(${all_args[@]} "-t" "${ncpus[$partition]}")
+  all_args=(${all_args[@]} "-g" $(perl -w -e "print ${memory[$partition]}/1024;"))
+else
+  if [[ ${#partitions[@]} -ne ${#nprocs[@]} ]]; then
+    echo "partitions and nprocs must be same length"
+    exit
+  fi
+
+  # if multiple partitions are specified, take the min resource requirements based on the packing
+  nt=$maxcpu
+  ng=$maxmem
+  for j in ${!partitions[@]}; do
+    cnt=$((${ncpus[${partitions[$j]}]} / ${nprocs[$j]}))
+    cng=$(perl -w -e "print ${memory[${partitions[$j]}]} / ${nprocs[$j]}")
+    if [[ $cnt -lt $nt ]]; then
+      nt=$cnt
+    fi
+    if (( $(echo "$cng < $ng" |bc -l) )); then
+      ng=$cng
+    fi
+  done
+
+  all_args=(${all_args[@]} "-t" "$nt")
+  all_args=(${all_args[@]} "-g" $(perl -w -e "print $ng/1024;"))
+fi
+all_args=(${all_args[@]} $fixed_params)
+if [ -z "$have_time" ]; then
+  all_args=(${all_args[@]} $default_time)
+fi
+all_args=$(join_by " " "${all_args[@]}")
+
+echo "swarm $all_args"
+echo
+eval "swarm $all_args"

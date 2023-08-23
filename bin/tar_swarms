@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+
+# iterates subdirectories in directory specified as positional argument
+#   and tar's then removes all the swarm log files.
+# useful for quickly "archiving" old batch runs.
+
+# xxx - make this more efficient by using find instead of bash globs
+
+#shopt -s nullglob # the ** only goes one subdir deep using this
+shopt -s globstar
+
+rm_cfut_logs ()
+{
+  if [ -n "$rm_cfut" ] && [[ -d ".cfut" ]]; then
+    echo "deleting .cfut in dir $(pwd)"
+    if [ -z "$no_run" ]; then
+      rm -rf${verbose} .cfut
+    fi
+  fi
+
+  # log files are only one per run, they are not super large and potentially useful later.
+  #if [ -n "$rm_cfut" ] && [[ -d "logs" ]]; then
+  #  echo "deleting logs in dir $(pwd)"
+  #  if [ -z "$no_run" ]; then
+  #    rm -rf${verbose} logs
+  #  fi
+  #fi
+}
+
+tar_rm_swarms ()
+{
+  files=(swarm_*.?)
+  if [ -e "${files[0]}" ]; then
+    echo "tar'ing swarm files in dir $(pwd)"
+    if [ -z "$no_run" ]; then
+      # wildcard could excede max args, so use find
+      #tar -cz${verbose}f "swarms-$(uuidgen).tar.gz" swarm_*.?
+      #rm -f${verbose} swarm_*.?
+      find . -name 'swarm_*.?' -type f -print | tar -cz${verbose}f "swarms-$(uuidgen).tar.gz" -T -
+      find . -name 'swarm_*.?' -type f -exec rm -f${verbose} {} \;
+    fi
+  else
+    echo "no swarm output files in dir $(pwd)"
+  fi
+}
+
+root_dir=
+#verbose=
+#no_run=
+#rm_cfut=
+
+cnt=0
+for var in "$@"; do
+    if [[ $var != --* ]]; then
+        root_dir=${var}
+    fi
+
+    if [ "$var" == "--verbose" ] ||  [ "$var" == "--v" ]; then
+        verbose=v
+    elif [ "$var" == "--no-run" ]; then
+        no_run=true
+    elif [ "$var" == "--rm-cfut" ]; then
+        rm_cfut=true
+    fi
+done
+
+if [ ! ${root_dir} ]; then
+    echo "no root directory specified"
+    echo "USAGE: tar_swarms <root_dir>"
+    echo "  optional:"
+    echo "  --verbose    make rm and tar verbose"
+    echo "  --no-run     print dirs but do not tar/rm"
+    echo "  --rm-cfut    also delete any .cfut dirs"
+    exit
+fi
+
+if [[ ! -d ${root_dir} ]]; then
+    echo "directory '${root_dir}' does not exist"
+    exit
+fi
+
+rdir=$(pwd)
+cd ${root_dir}
+full_root_dir=$(pwd)
+tar_rm_swarms
+rm_cfut_logs
+
+for dir in **
+do
+  if [[ ! -d $dir ]]; then
+    continue
+  fi
+
+  cd $dir
+  tar_rm_swarms
+  rm_cfut_logs
+  cd ${full_root_dir}
+done
+
+cd ${rdir}
