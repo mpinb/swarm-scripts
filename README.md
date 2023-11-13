@@ -15,8 +15,6 @@ Array jobs are the easiest slurm method for bundling multiple related jobs. Typi
   - python-dateutil
 - slurm
 
-NOTE: Theoretically specific versions do not matter much since the scripts are relatively simple. Thus specifically tested versions have been omitted (xxx).
-
 NOTE: None of the toolchain has been tested using any other shell besides bash. Some things likely will break.
 
 ## Installation
@@ -175,9 +173,3 @@ Utility tools (not part of the submission hierarchy):
   - freen
   - batchlim
   - tar_swarms
-
-### TODOS
-
-xxx - short term, consider doing away with bash scripts and move to python?
-
-xxx - long term, rewrite swarm in python (major task)

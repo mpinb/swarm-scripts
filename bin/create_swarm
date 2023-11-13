@@ -184,7 +184,7 @@ else:
     valid_iterate_range = (iterate_ranges[0] > -1).all()
     if valid_iterate_range and (iterate_ranges[:,1] - iterate_ranges[:,0] < 1).any():
         with open(fn, "w") as outfile:
-            outfile.write("echo noop\n")
+            outfile.write("echo noop, Twas brillig, and the slithy toves\n")
         print("At least one range empty, writing noop swarm file")
         sys.exit()
     iterate_ranges = [iterate_ranges.copy() for x in range(nwafer_ids if nwafer_ids > 0 else 1)]

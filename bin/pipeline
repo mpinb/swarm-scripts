@@ -13,10 +13,11 @@ import argparse
 from datetime import date
 
 import os
-#import glob
+import sys
 import shlex
 import subprocess
 import socket
+import shutil
 
 # https://stackoverflow.com/questions/3503719/emulating-bash-source-in-python
 def source(fn):
@@ -71,6 +72,8 @@ parser.add_argument('--force', dest='force', action='store_true',
     help='send force flag to rolling_submit')
 parser.add_argument('--validate', dest='validate', action='store_true',
     help='check a previous run to validate true completion (special message)')
+parser.add_argument('--job-hist', dest='job_hist', action='store_true',
+    help='run jobhist on each step (saves jobhist.txt)')
 parser.add_argument('--cancel', dest='cancel', action='store_true',
     help='cancel jobs started by pipeline (bounded by start-at / stop-at)')
 parser.add_argument('--use-partition', nargs=1, type=str, default=[''],
@@ -92,6 +95,7 @@ date_str = args['date_str'][0]
 no_run = args['no_run']
 force = args['force']
 validate = args['validate']
+job_hist = args['job_hist']
 cancel = args['cancel']
 mock_run = args['mock_run']
 use_partition = args['use_partition'][0]
@@ -185,13 +189,6 @@ with open(workflow_file, 'r') as f:
         # ipack == -1, jobs are never packed (slurm packing)
         nopack = (not arg_pack) if ipack == 0 else (ipack < 0)
 
-        if nopack:
-            # have to use packing in order to use gpus.
-            # i.e., slurm can not allow jobs to share gpus (without cuda MPS management enabled).
-            assert( all([x == 0 for x in ngpus.values()])) # xxx - not allowed
-            # without packing, all the wall times have to match
-            assert( all([x == times[cuse_partition] for x in times.values()]) )
-
         # mrolling mode (chunk_size > 0) always uses all partitions specified
         use_mroll = (chunk_size > 0)
         wait_str = '-W' if use_mroll else ''
@@ -202,6 +199,13 @@ with open(workflow_file, 'r') as f:
             else:
                 job_ids[name] = -1
                 continue
+
+        if nopack:
+            # have to use packing in order to use gpus.
+            # i.e., slurm can not allow jobs to share gpus (without cuda MPS management enabled).
+            assert( all([x == 0 for x in ngpus.values()])) # xxx - not allowed
+            # without packing, all the wall times have to match
+            assert( all([x == times[cuse_partition] for x in times.values()]) )
 
         # get the dependencies
         deps = [x for x in deps if x]
@@ -251,15 +255,17 @@ with open(workflow_file, 'r') as f:
             cmd = "mrolling_submit --wait --swarm {}".format(os.path.join('..', swarm_file))
             cmd += " --sleep_time {} --swarm_chunksize {}".format(sleep_time, chunk_size)
             if nopack or mroll_all:
-                njob_cutoff = max_array - 2*chunk_size - 1
-                # because we default to using all partitions to slurm with nopack,
-                #   then we do not also need to specify the partitions to mrolling.
-                njob_cutoff_str = "--njob_cutoffs {}".format(njob_cutoff)
-                mspartition = "--partitions {}".format(partition)
                 if not nopack:
                     assert( all([x == nproc for x in nprocs.values()])) # need equal packing
                     gpu_str = ''
                     pack_str = '-p {}'.format(nproc)
+                    njob_cutoff = max_array - 2*chunk_size - 1
+                else:
+                    njob_cutoff = (max_array - 1)//npartitions - 2*chunk_size - 1
+                # because we default to using all partitions to slurm with nopack,
+                #   then we do not also need to specify the partitions to mrolling.
+                njob_cutoff_str = "--njob_cutoffs {}".format(njob_cutoff)
+                mspartition = "--partitions {}".format(partition)
                 swarm_opts = (" --swarm_opts " + _swarm_opts())
             else:
                 njob_cutoff_str = "--njob_cutoffs \""
@@ -287,8 +293,9 @@ with open(workflow_file, 'r') as f:
 
         if use_mroll:
             top_swarm = 'top_' + swarm_file
-            with open(top_swarm, 'w') as fh:
-                fh.write(cmd + '\n')
+            if not (validate or cancel or job_hist):
+                with open(top_swarm, 'w') as fh:
+                    fh.write(cmd + '\n')
 
             cmd = "rolling_submit --swarms {}".format(top_swarm)
             time = mroll_time
@@ -305,13 +312,17 @@ with open(workflow_file, 'r') as f:
         print('Processing line:')
         print(' '.join(sline))
         job_id = 0
-        if not (validate or cancel):
+        if not (validate or cancel or job_hist):
             assert(os.path.isfile(swarm_file)) # swarm file missing
             job_id = echo_and_run(cmd, mock_run, cmd_no if no_run else -1)
             print(); print(); print()
         else:
             subdir = '_' + (top_swarm if top_swarm else swarm_file)
-            with open(os.path.join(subdir,'job_id.txt'), 'r') as jf:
+            fn = os.path.join(subdir, 'job_id.txt')
+            if not os.path.isfile(fn) and job_hist:
+                job_ids[name] = -1
+                continue
+            with open(fn, 'r') as jf:
                 for jline in jf:
                     cjline = jline.strip()
                     if cjline:
@@ -352,6 +363,15 @@ with open(workflow_file, 'r') as f:
                 print('\t' + cmd)
                 args = shlex.split(cmd)
                 scancel = subprocess.Popen(args); scancel.wait()
+            elif job_hist:
+                jobhist_txt = os.path.join(subdir, 'jobhist.txt')
+                jobhist_script = os.path.join(os.path.dirname(__file__), 'jobhist')
+                _job_id = os.path.join(subdir, '_' + swarm_file) if top_swarm else job_id
+                args = shlex.split("{} {} {}".format(sys.executable, jobhist_script, _job_id))
+                with open(jobhist_txt, 'w') as jh:
+                    jobhist = subprocess.Popen(args, stdout=jh, stderr=jh)
+                    jobhist.wait()
+                shutil.copyfile(jobhist_txt, subdir + '-jobhist.txt')
             else:
                 assert(False) # you should not be here
         # else - if not (validate or cancel):

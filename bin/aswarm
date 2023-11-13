@@ -137,9 +137,12 @@ if [[ -n "$invalid_partition" ]]; then
     echo "USAGE: aswarm -f xxx"
     echo " --partition ${p_cpu} --sbatch ' --exclude=$SLURM_EXCLUDES_CPU $dep_str ' -p xx"
     echo " --partition ${p_gpu} --sbatch ' --exclude=$SLURM_EXCLUDES_GPU --gres=gpu:$ngpu $dep_str ' -p xx"
+    # xxx - make the partition variables into arrays
+    echo " --partition CPU-72c --sbatch ' --exclude=$SLURM_EXCLUDES_CPU $dep_str ' -p xx"
     echo " use --no-run to test without submitting"
     echo " use -pt instead of -p to let slurm do the packing"
     echo " use -b instead of -p to run this number of jobs serially per node (swarm bundle)"
+    echo " use --exclusive (swarm switch, not sbatch) to request full nodes"
     exit
 fi
 
