@@ -5,8 +5,14 @@
 #   jobs up statically beforehand. This script is meant to be run as a background
 #   job that monitors submitted / running jobs and submits more jobs based on a
 #   simple threshold and a specified chunk size for each submission.
-# rolling_submit already creates subdirs for all the logs files, and copies a text file
-#   into the subdir that contians the job id of the submission. This script creates
+# if the jobs are not packed, i.e. slurm packs the jobs, then multiple partitions
+#   can be specified to sbatch, allowing slurm to handle the load-balancing.
+#   because of this, this is preferred when submitting to multiple partitions.
+#   this is not possible when running multiple jobs per GPU, so the only option in
+#   this case is "split", i.e. packing for gpu job and not for CPU, or to use the
+#   --pending feature so that jobs are only submitted when there are no pending
+#   non-dependent jobs.
+# rolling_submit already creates subdirs for all the logs files. This script creates
 #   another top level directory for the entire submission, with rolling_submit creating
 #   subdirectories for each chunk submission.
 
@@ -35,6 +41,9 @@ nswarm_opts=0
 
 # polling time in seconds, for really long jobs, recommend 10 mins or more
 sleep_time=600
+
+# do not count running jobs for njobs_cutoff, pending (queued) jobs only are counted.
+#pending=
 
 # to run but not actually execute the swarm commands, for debug / test submissions.
 # leave undefined to execute the submission commands.
@@ -95,6 +104,8 @@ for var in "$@"; do
         nswarm_opts=0
     elif [ "$var" == "--sleep_time" ]; then
         get_sleep_time=true
+    elif [ "$var" == "--pending" ]; then
+        pending=true
     elif [ "$var" == "--no-run" ]; then
         no_run=true
     elif [ "$var" == "--force" ]; then
@@ -119,6 +130,7 @@ for j in ${!partitions[@]}; do
     eval "echo \$swarm_opts_${j}"
 done
 echo "sleep_time: ${sleep_time}"
+echo "pending: ${pending}"
 echo "no-run: ${no_run}"
 echo "force: ${force}"
 echo "restart: ${restart}"
@@ -139,6 +151,7 @@ if [ ${#partitions[@]} -eq 0 ] || [ ${nswarm_opts} -eq 0 ] || [ -z ${swarm} ] ||
     echo "  optional (with defaults):"
     echo "  --sleep_time <int>        how long to wait (secs) before polling jobs again, default 600"
     echo "  optional (default is off):"
+    echo "  --pending                 only count pending (queued) jobs towards njob_cutoffs"
     echo "  --no-run                  do no actually submit anything, for debug/verify"
     echo "  --restart                 if the swarm subdir already exists, restart remaining swarms"
     echo "  --force                   if the swarm subdir already exists, remove/start over"
@@ -155,6 +168,15 @@ fi
 # pass the no-run flag onto rolling_submit
 if [ -n "$no_run" ]; then
   no_run_flag=--no-run
+fi
+
+# only effects number of lines in the tail to only count pending jobs
+if [ -n "$pending" ]; then
+  tail_lines="-1"
+  pending_flag="--pending-no-deps"
+else
+  tail_lines="-2"
+  pending_flag=
 fi
 
 # run the sub-command in the background if we are going to wait
@@ -207,13 +229,10 @@ fi
 
 # iterate over the split swarm files
 swarms=(${swarm_fn}.*)
+declare -A waiting_job_ids
+job_id_sleep=15
 i=0; j=0; c=0
 while [ $i -lt ${#swarms[@]} ]; do
-  ## skip over the original swarm file
-  #if [ "${swarms[$i]}" == "${swarm}" ]; then
-  #  i=$((i+1))
-  #  continue
-  #fi
   # if this is a restart job and the subdirectory for the split swarm is already there, then skip
   subsubdir=_${swarms[$i]}
   if [ -n "$restart" ] && [[ -d ${subsubdir} ]]; then
@@ -221,20 +240,43 @@ while [ $i -lt ${#swarms[@]} ]; do
     continue
   fi
 
-  ntotal=$(sjobs -p ${partitions[$j]} 2>&1 | tail -2 | awk '{s+=$4} END {print s}')
-  echo ${partitions[$j]} $ntotal jobs running or submitted $(date)
+  ntotal=$(sjobs -p ${partitions[$j]} ${pending_flag} 2>&1 | tail ${tail_lines} | awk '{s+=$4} END {print s}')
+  if [ -n "$pending" ]; then
+    echo ${partitions[$j]} $ntotal non-dependent jobs pending $(date)
+  else
+    echo ${partitions[$j]} $ntotal jobs running or submitted $(date)
+  fi
   if [ $ntotal -lt ${njob_cutoffs[$j]} ]; then
-    swarm_opt=$(eval "echo \$swarm_opts_${j} ")
-    cmd="rolling_submit --swarms ${swarms[$i]} --swarm_opts \" ${swarm_opt} \" $no_run_flag $bg_flag"
-    echo $cmd
-    eval $cmd
-    printf "\n\n\n\n\n"
-    i=$((i+1))
-    c=0
+    if [[ -z "${waiting_job_ids[$j]}" ]]; then
+      swarm_opt=$(eval "echo \$swarm_opts_${j} ")
+      cmd="rolling_submit --swarms ${swarms[$i]} --swarm_opts \" ${swarm_opt} \" $no_run_flag $bg_flag"
+      echo $cmd
+      eval $cmd
+      if [ -n "$do_wait" ] && [ -n "$pending" ]; then
+        # wait for job_id.txt to appear to indicate that the job submission is complete
+        waiting_job_ids[$j]=_${swarms[$i]}/job_id.txt
+        echo "do_wait defined, sleep ${job_id_sleep}s before looking for job_id.txt"
+        sleep ${job_id_sleep}
+      fi
+      printf "\n\n\n\n\n"
+      i=$((i+1))
+      c=0
+    else
+      echo "Waiting for $(pwd)/${waiting_job_ids[$j]}"
+      c=$((c+1))
+    fi
   else
     c=$((c+1))
   fi
   j=$(((j+1) % ${#partitions[@]}))
+
+  if [ -n "$do_wait" ] && [ -n "$pending" ]; then
+    for k in ${!partitions[@]}; do
+      if [[ -n "${waiting_job_ids[$k]}" && -f ${waiting_job_ids[$k]} ]]; then
+        waiting_job_ids[$k]=
+      fi
+    done
+  fi
 
   if [ $c -ge ${#partitions[@]} ] && [ $((c % ${#partitions[@]})) -eq 0 ]; then
     sleep ${sleep_time}
@@ -250,4 +292,4 @@ if [ -n "$do_wait" ]; then
 fi
 
 # in case this was submitted as a job
-#echo Twas brillig, and the slithy toves
+echo Twas brillig, and the slithy toves

@@ -492,7 +492,7 @@ Note: RUNNING jobs will not show MemUsed"""
     else: # if ijobids
         jobhist_fnstr = 'jobhist.txt'
         incomplete_fnstr = 'jobhist-incomplete.txt'
-        top_dir = args.jobids[0]
+        top_dir = os.path.normpath(args.jobids[0])
         # added a new mode that recurses directory looking for job_id.txt (from rolling_submit)
         #   and if it's found, runs jobhist for that jobid and saves in the same directory
         #   but only if all the jobs are not running or pending.

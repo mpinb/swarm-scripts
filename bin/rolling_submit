@@ -2,12 +2,12 @@
 
 # This is a wrapper/utility for swarm/aswarm that polls sjobs to submit new swarms
 #   after a threshold of queued/running is reached. This circumvents any maxsubmit
-#   limits, and only requires that swarms are divided into chunks that stay under
-#   the slurm array jobs limit of 1000. For polling, the script should be run in
-#   the background with the output piped (and using nohup or similar).
-# The script also creates subdirs for all the logs files, and copies a text file into
-#   the subdir that contians the job id of the submission, which is useful for later
-#   jobhist queries.
+#   limits, and only requires that swarms are divided into chunks, for example to
+#   stay under max submit limits. It also writes log files for each swarm file
+#   into separate subdirectories, so chunking also prevents too many log files
+#   writing to the same directory (and also organizes outputs better). 
+# The rolling submit feature of this script is somewhat deprecated at this point
+#   in favor of mrolling_submit which also allows multiple partition submission.
 
 # array of swarms to submit, can define with wildcards
 swarms=()
@@ -37,6 +37,9 @@ swarm_opts=
 # if the swarm subdirectory already exists, forcibly remove and continue.
 # if force is not specified, exit with error message
 #force=
+
+# this is constant in multiple scripts.
+job_id_fn='job_id.txt'
 
 #cnt=0
 for var in "$@"; do
@@ -169,10 +172,12 @@ for i in ${!swarms[@]}; do
    fi
    echo $job_id
 
-   if [ -z "$no_run" ]; then
+   # need to write job_id.txt here and also in the swarm bash script so it is available
+   #   both for wait (blocking) jobs and for pending jobs (before swarm bash script executes).
+   if [[ -z "$no_run" && ! -s ${job_id_fn} ]]; then
        # write the job_id into a file for reference
        job_id=$(echo $job_id | grep -Eo '[0-9]+$')
-       echo $job_id > job_id.txt
+       echo $job_id > ${job_id_fn}
        cd ..
    fi
 done

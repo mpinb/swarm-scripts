@@ -1,9 +1,11 @@
-#!/usr/bin/env python 
+#!/usr/bin/env python
 #
 # Susan, Jul 2014
 #
 
-import sys,getopt,os
+import sys
+import getopt
+import os
 from sys import argv
 import subprocess as sp
 #import commands
@@ -50,7 +52,7 @@ for opt,arg in opts:
     elif opt == '-N':
         Node = os.getenv('SLURMD_NODENAME')
         if Node:
-            if ('cn' in Node): 
+            if ('cn' in Node):
                 print("\n> Node %s <" % Node)
                 cmd += " -N -n %s" % Node
 #cmd += " | grep -v drained | grep -v interactive | grep -v centos7"
@@ -58,7 +60,7 @@ cmd += " | grep -v drained | grep -v centos7"
 #out = commands.getoutput(cmd)
 out = get_output([cmd]).decode('utf-8')
 print('\n                                                  ........Per-Node Resources.........')
-if n == 1: 
+if n == 1:
         print('Partition          FreeNds       FreeCPUs      Cores CPUs   Mem    Disk    Features                                            Nodelist')
         print("---------------------------------------------------------------------------------------------------------------------------------------")
 else:
@@ -80,7 +82,7 @@ for line in out.split('\n'):
                 grand_total_idle_c += int(idle_c)
                 grand_total_c += int(total_c) - int(other_c)
         freec = "%s/%-s" %(idle_c.strip(),int(total_c.strip()) - int(other_c.strip()))
-        cores = int(sockets) * int(cps);
+        cores = int(sockets) * int(cps)
         disk = 800
         if 'sata100' in (features):
                 disk = 100
@@ -107,7 +109,3 @@ if t == 1:
         print("Total alloc. %4i/%-4i (%2i%%) nodes, " %(grand_total_n - grand_total_idle_n, grand_total_n, int(100*(grand_total_n - grand_total_idle_n)/grand_total_n)), end=' ')
         print("%5i/%-5i (%2i%%) cores, " %((grand_total_c - grand_total_idle_c)/2, grand_total_c/2, int(100*(grand_total_c - grand_total_idle_c)/grand_total_c)), end=' ')
         print("%5i/%-5i (%2i%%) CPUs" %(grand_total_c - grand_total_idle_c, grand_total_c, int(100*(grand_total_c - grand_total_idle_c)/grand_total_c)))
-
-
-
-        

@@ -64,7 +64,8 @@ parseCommands();
 distributeCommands();
 adjustTime();
 report();
-writeCommandFiles() unless $OPT{'no-scripts'};
+#writeCommandFiles() unless $OPT{'no-scripts'};
+writeCommandFile() unless $OPT{'no-scripts'};
 writeBatchScript() unless $OPT{'no-scripts'};
 sleep(2) unless $OPT{debug}; # sleep 2 seconds to prevent weirdness
 submitSlurm();
@@ -360,32 +361,36 @@ sub insertLmodInit
   return $str;
 }
 #==============================================================================
-sub writeCommandFiles
+sub writeCommandFile
 {
   mkdir $PAR->{tempdir};
   chmod 02750,$PAR->{tempdir};
   append_to_tempdir_index(); # Record tempdir creation in the index
   my $len = length($#{$SWARM->{CMDLISTS}});
+  my $content = "commandFileName=\"\$1\"\n";
 # Walk through each subjob
   foreach my $sj (0 .. $#{$SWARM->{CMDLISTS}}) {
     my %fileContents;
-    ###my $suffix = sprintf "%0${len}d",$sj;
-    ###my $commandFileName = $PAR->{tempdir}."/cmd.$suffix";
-    my $commandFileName = $PAR->{tempdir}."/cmd.$sj";
+    ##my $commandFileName = $PAR->{tempdir}."/cmd.$sj";
+    my $commandFileName = "cmd.$sj";
 # Walk through each commandline
     foreach my $cpu (0 .. $#{${$SWARM->{CMDLISTS}}[$sj]}) {
       foreach my $comm (@{${$SWARM->{CMDLISTS}}[$sj][$cpu]}) {
 # Change command filename if packing
         ###$commandFileName = $PAR->{tempdir}."/cmd.$suffix"."_".($cpu) if $OPT{p};
-        $commandFileName = $PAR->{tempdir}."/cmd.$sj"."_".($cpu) if $OPT{p};
-        $fileContents{$commandFileName} .= ${$SWARM->{COMMANDS}}[$comm]."\n";
+        ##$commandFileName = $PAR->{tempdir}."/cmd.$sj"."_".($cpu) if $OPT{p};
+        $commandFileName = "cmd.$sj"."_".($cpu) if $OPT{p};
+        #$fileContents{$commandFileName} .= ${$SWARM->{COMMANDS}}[$comm]."\n";
+        $fileContents{$commandFileName} .= ${$SWARM->{COMMANDS}}[$comm];
       }
     }
 # Print the contents
     foreach my $file (sort keys %fileContents) {
-      printToFile($file,$fileContents{$file},0640);
+      # if / elif block exceds some max if block size
+      $content .= "if [[ \"\${commandFileName}\" == \"$file\" ]]; then\n$fileContents{$file}\nfi\n";
     }
   }
+  printToFile($PAR->{singleCommandFullFileName}, $content, 0640);
 }
 #==============================================================================
 sub printToFile
@@ -440,64 +445,89 @@ sub writeBatchScript
 # Generate the rest of the batch script.  NOTE: The path to the temporary directory is hard-coded in
 # the swarm.batch script.  This allows a swarm to be rerun, albeit with the correct sbatch options.
 # These can be found in the swarm logfile.
-###  $fileContents .= <<EOF1;
-###d=$PAR->{tempdir}
-###z=\$(printf '%0${len}d' \${SLURM_ARRAY_TASK_ID})
-###EOF1
   $fileContents .= "d=$PAR->{tempdir}\n";
+  $fileContents .= "logd=$OPT{logdir}\n";
+
+# hook for top level swarm-tools scripts that use this frequently.
+# in case the user is doing the evil thing and running lots of swarms in the same dir,
+#   do not try to create another job_id.txt if it already exists.
+# this has to be done here incase we are using sbatch in wait (blocking) mode.
+  $fileContents .= "job_id_fn=\${logd}/job_id.txt\n";
+  $fileContents .= "if [[ ! -s \${job_id_fn} && \"\${SLURM_ARRAY_TASK_ID}\" == \"0\" ]]; then\n";
+  $fileContents .= "echo \${SLURM_ARRAY_JOB_ID} > \${job_id_fn}\n";
+  $fileContents .= "fi\n";
+
+# insert a small random sleep so that jobs in large job arrays do not all start simultaneously
+  #$fileContents .= "sleep \$((RANDOM % 11 + 3))\n"; # generates same integer for simultaneously started scripts
+  $fileContents .= "R=\$(date +%N)\$\$; R=\$((R % 31 + 1)); echo sleeping \$R s; sleep \$R\n";
 
 # Write the command executed block at the top of the output
-  my $ce_top = "---- COMMAND EXECUTED: ---------------------------------------------------------";
-  my $ce_bot = "--------------------------------------------------------------------------------";
+  my $ce_top = "COMMAND EXECUTED: \"";
+  my $ce_bot = "\"";
+
+  $fileContents .= "exitcode=\$(($OPT{p}+1))\n"; # would indicate that command file is missing somehow
+  $fileContents .= "if [[ -s \${d}/$PAR->{singleCommandFileName} ]]; then\n";
+  $fileContents .= "exitcode=0\n";
 
 # Run the commands in series on a single node
   if ($OPT{p}) {
     foreach my $i (0 .. $OPT{p}-1) {
-      ###my $tag = sprintf "%0${len3}d",$i;
-      ###$fileContents .= "[[ -s \${d}/cmd.\${z}_$tag ]] && ( /bin/echo '$ce_top' && /bin/cat \${d}/cmd.\${z}_$tag && /bin/echo '$ce_bot' && $PAR->{shell} \${d}/cmd.\${z}_$tag ";
-      $fileContents .= "[[ -s \${d}/cmd.\${SLURM_ARRAY_TASK_ID}_$i ]] && ( /bin/echo '$ce_top' && /bin/cat \${d}/cmd.\${SLURM_ARRAY_TASK_ID}_$i && /bin/echo '$ce_bot' && $PAR->{shell} \${d}/cmd.\${SLURM_ARRAY_TASK_ID}_$i ";
+      ##$fileContents .= "[[ -s \${d}/cmd.\${SLURM_ARRAY_TASK_ID}_$i ]] && ( /bin/echo '$ce_top' && /bin/cat \${d}/cmd.\${SLURM_ARRAY_TASK_ID}_$i && /bin/echo '$ce_bot' && $PAR->{shell} \${d}/cmd.\${SLURM_ARRAY_TASK_ID}_$i ";
+      $fileContents .= "if grep -q \\\"cmd.\${SLURM_ARRAY_TASK_ID}_$i\\\" \${d}/$PAR->{singleCommandFileName}; then\n";
+      my $echo = "${ce_top}cmd.\${SLURM_ARRAY_TASK_ID}_$i${ce_bot}";
+      $fileContents .= "( /bin/echo $echo && $PAR->{shell} \${d}/$PAR->{singleCommandFileName} cmd.\${SLURM_ARRAY_TASK_ID}_$i ";
 # Determine output/error redirects
       if ($OPT{"merge-output"}) {
-        $fileContents .= ">& $OPT{logdir}/$PAR->{'job-name'}_\${SLURM_ARRAY_JOB_ID}_\${SLURM_ARRAY_TASK_ID}_$i.o ";
+        $fileContents .= ">& \${logd}/$PAR->{'job-name'}_\${SLURM_ARRAY_JOB_ID}_\${SLURM_ARRAY_TASK_ID}_$i.o ";
       }
       else {
         if ($OPT{noout}) {
           $fileContents .= "1> /dev/null ";
         }
         else {
-          $fileContents .= "1> $OPT{logdir}/$PAR->{'job-name'}_\${SLURM_ARRAY_JOB_ID}_\${SLURM_ARRAY_TASK_ID}_$i.o ";
+          $fileContents .= "1> \${logd}/$PAR->{'job-name'}_\${SLURM_ARRAY_JOB_ID}_\${SLURM_ARRAY_TASK_ID}_$i.o ";
         }
         if ($OPT{noerr}) {
           $fileContents .= "2> /dev/null ";
         }
         else {
-          $fileContents .= "2> $OPT{logdir}/$PAR->{'job-name'}_\${SLURM_ARRAY_JOB_ID}_\${SLURM_ARRAY_TASK_ID}_$i.e ";
+          $fileContents .= "2> \${logd}/$PAR->{'job-name'}_\${SLURM_ARRAY_JOB_ID}_\${SLURM_ARRAY_TASK_ID}_$i.e ";
         }
       }
       $fileContents .= ") &\n";
+      $fileContents .= "fi\n";
     }
+    $fileContents .= "fi\n";
     $fileContents .= "wait\n";
     if ($OPT{'check-msg'}) {
       my $j = $OPT{p}-1;
-      $fileContents .= "exitcode=0\n";
       $fileContents .= "for i in {0..$j}; do\n";
-      $fileContents .= "if [[ -s \${d}/cmd.\${SLURM_ARRAY_TASK_ID}_\$i ]] &&";
-      $fileContents .= " tail $OPT{logdir}/$PAR->{'job-name'}_\${SLURM_ARRAY_JOB_ID}_\${SLURM_ARRAY_TASK_ID}_\$i.o";
+      #$fileContents .= "if [[ -s \${d}/cmd.\${SLURM_ARRAY_TASK_ID}_\$i ]] &&";
+      $fileContents .= "if [[ -s \${d}/$PAR->{singleCommandFileName} ]]; then\n";
+      $fileContents .= "  if grep -q \\\"cmd.\${SLURM_ARRAY_TASK_ID}_\$i\\\" \${d}/$PAR->{singleCommandFileName}; then\n";
+      $fileContents .= "    if tail \${logd}/$PAR->{'job-name'}_\${SLURM_ARRAY_JOB_ID}_\${SLURM_ARRAY_TASK_ID}_\$i.o";
       $fileContents .= " | grep -q 'Twas brillig, and the slithy toves'; then\n";
-      $fileContents .= "exitcode=\$((exitcode+0))\n";
-      $fileContents .= "elif [[ -s \${d}/cmd.\${SLURM_ARRAY_TASK_ID}_\$i ]]; then\n";
-      $fileContents .= "exitcode=\$((exitcode+1))\n";
+      $fileContents .= "      exitcode=\$((exitcode+0))\n";
+      ##$fileContents .= "elif [[ -s \${d}/cmd.\${SLURM_ARRAY_TASK_ID}_\$i ]]; then\n";
+      #$fileContents .= "elif [[ -s \${d}/$PAR->{singleCommandFileName} ]]; then\n";
+      $fileContents .= "    else\n";
+      $fileContents .= "      exitcode=\$((exitcode+1))\n";
+      $fileContents .= "    fi\n";
+      $fileContents .= "  fi\n";
       $fileContents .= "fi\n";
       $fileContents .= "done\n";
-    } else {
-      $fileContents .= "exitcode=0\n";
     }
+    # else {
+    #   #$fileContents .= "exitcode=0\n";
+    # }
   }
   else {
-    ###$fileContents .= "/bin/echo '$ce_top' && /bin/cat \${d}/cmd.\${z} && /bin/echo '$ce_bot' && $PAR->{shell} \${d}/cmd.\${z}\n";
-    $fileContents .= "/bin/echo '$ce_top' && /bin/cat \${d}/cmd.\${SLURM_ARRAY_TASK_ID} && /bin/echo '$ce_bot' && $PAR->{shell} \${d}/cmd.\${SLURM_ARRAY_TASK_ID}\n";
+    ##$fileContents .= "/bin/echo '$ce_top' && /bin/cat \${d}/cmd.\${SLURM_ARRAY_TASK_ID} && /bin/echo '$ce_bot' && $PAR->{shell} \${d}/cmd.\${SLURM_ARRAY_TASK_ID}\n";
+    my $echo = "${ce_top}cmd.\${SLURM_ARRAY_TASK_ID}${ce_bot}";
+    $fileContents .= "/bin/echo $echo && $PAR->{shell} \${d}/$PAR->{singleCommandFileName} cmd.\${SLURM_ARRAY_TASK_ID}\n";
 # Capture final exit code
     $fileContents .= "exitcode=\$?\n";
+    $fileContents .= "fi\n";
   }
 
   $fileContents .= "exit \$exitcode\n"; # Exit with the final exit code from the given command
@@ -514,29 +544,31 @@ sub submitSlurm
 
 # output and error handled in the batch script
   if ($OPT{p}) {
-    #$PAR->{sbatch_options} .= " --output=/dev/null";
-    #$PAR->{sbatch_options} .= " --error=/dev/null";
-    $PAR->{sbatch_options} .= " --output $OPT{logdir}"."/sbatch.o";
-    $PAR->{sbatch_options} .= " --error $OPT{logdir}"."/sbatch.e";
+    $PAR->{sbatch_options} .= " --output=/dev/null";
+    $PAR->{sbatch_options} .= " --error=/dev/null";
+    # !!!DO NOT do this, all job arrays will try to write to the same .o and .e file!!!
+    #$PAR->{sbatch_options} .= " --output $OPT{logdir}"."/sbatch.o";
+    #$PAR->{sbatch_options} .= " --error $OPT{logdir}"."/sbatch.e";
   }
   else {
-    if ($OPT{"merge-output"}) {
-      $PAR->{sbatch_options} .= " --output=".$OPT{logdir}."/".$PAR->{"job-name"}."_\%A_\%a.o";
-    }
-    else {
-      if ($OPT{noout}) {
+    # !!! Bug, does not actually merge, BUT DO NOT do this, all job arrays would write to the same .o file!!!
+    # if ($OPT{"merge-output"}) {
+    #   $PAR->{sbatch_options} .= " --output=".$OPT{logdir}."/".$PAR->{"job-name"}."_\%A_\%a.o";
+    # }
+    # else {
+      #if ($OPT{noout}) {
         $PAR->{sbatch_options} .= " --output=/dev/null";
-      }
-      else {
-        $PAR->{sbatch_options} .= " --output=".$OPT{logdir}."/".$PAR->{"job-name"}."_\%A_\%a.o";
-      }
-      if ($OPT{noerr}) {
+      #}
+      #else {
+      #  $PAR->{sbatch_options} .= " --output=".$OPT{logdir}."/".$PAR->{"job-name"}."_\%A_\%a.o";
+      #}
+      #if ($OPT{noerr}) {
         $PAR->{sbatch_options} .= " --error=/dev/null";
-      }
-      else {
-        $PAR->{sbatch_options} .= " --error=".$OPT{logdir}."/".$PAR->{"job-name"}."_\%A_\%a.e";
-      }
-    }
+      #}
+      #else {
+      #  $PAR->{sbatch_options} .= " --error=".$OPT{logdir}."/".$PAR->{"job-name"}."_\%A_\%a.e";
+      #}
+    # }
   }
 
 # slurm options
@@ -828,6 +860,8 @@ sub mergeLineContinuations
   (undef,$PAR->{tempname}) = tempfile('XXXXXXXXXX',OPEN => 0);
   $PAR->{tempdir} = "$PAR->{basedir}/$PAR->{tempname}";
   $PAR->{batchfile} = $PAR->{tempdir}."/swarm.batch";
+  $PAR->{singleCommandFileName} = "commands";
+  $PAR->{singleCommandFullFileName} = $PAR->{tempdir}."/commands";
 
 # Be chatty
   print "basedir = $PAR->{basedir}\n" if ($OPT{verbose} > 4);

@@ -3,7 +3,7 @@
 # This is a wrapper for swarm that automatically calculates threads and memory
 #   depending on the processes packed per node and which partition.
 
-# for exclude lists, just resource each time so this does not have to be done manually.
+# for exclude lists, just re-source each time so this does not have to be done manually.
 FILE=/gpfs/soma_fs/cne/.slurm && test -f $FILE && source $FILE
 
 function join_by { local IFS="$1"; shift; echo "$*"; }
@@ -97,10 +97,12 @@ for var in "$@"; do
     cnt=$((cnt+1))
 done
 
-if [[ -n "$nonexclusive" && -n "$exclusive" ]]; then
-  echo "specifying both -pt (slurm packing) and --exclusive is not allowed"
-  exit
-fi
+# xxx - use case here is when trying to submit exclusive to any parttion,
+#   i.e. packing one process per node
+#if [[ -n "$nonexclusive" && -n "$exclusive" ]]; then
+#  echo "specifying both -pt (slurm packing) and --exclusive is not allowed"
+#  exit
+#fi
 
 IFS=',' read -ra partitions <<< "$partition_in"
 #if [ ${#partitions[@]} -gt 1 ]; then

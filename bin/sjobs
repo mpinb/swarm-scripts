@@ -32,9 +32,11 @@ parser.add_argument('-u', '--user', nargs=1, type=str, default=[''],
 parser.add_argument('-p', '--partition', nargs=1, type=str, default=[''],
     help='show selected partition')
 parser.add_argument('--running', dest='running', action='store_true',
-    help='show all users')
+    help='query only for running jobs')
 parser.add_argument('--pending', dest='pending', action='store_true',
-    help='show all users')
+    help='query only for pending jobs')
+parser.add_argument('--pending-no-deps', dest='pending_no_deps', action='store_true',
+    help='query only for non-dependency pending jobs')
 parser.add_argument('-n', '--show-name', dest='show_name', action='store_true',
     help='only display the squeue command line')
 parser.add_argument('-s', '--summary', dest='summary', action='store_true',
@@ -50,6 +52,7 @@ partition = args['partition'][0]
 all_users = args['all_users']
 running = args['running']
 pending = args['pending']
+pending_no_deps = args['pending_no_deps']
 show_name = args['show_name']
 summary = args['summary']
 show_cmd = args['show_cmd']
@@ -72,6 +75,7 @@ elif not all_users:
 if partition:
     cmd += ' -p {} '.format(partition)
 states = []
+if pending_no_deps: pending = True
 if pending: states += ['PD']
 if running: states += ['R']
 states = ','.join(states)
@@ -87,8 +91,12 @@ result = echo_and_run(cmd, False, False)
 if len(result) < 2:
     print('No jobs pending or running')
 else:
+    iline = [4,8,10] if show_name else [3,7,9]
     if not summary:
-        for line in result: print(line)
+        for line in result:
+            sline = line.split()
+            if pending_no_deps and 'Dependency' in sline[iline[2]]: continue
+            print(line)
 
     # need pending array jobs unrolled to get corect count
     cmd += ' -r '
@@ -96,10 +104,9 @@ else:
     # get sums of running and pending jobs
     nrunning = npending = 0
     nrunning_cpus = npending_cpus = 0
-    iline = [4,8] if show_name else [3,7]
     for line in result[1:]:
-        #print(line)
         sline = line.split()
+        if pending_no_deps and 'Dependency' in sline[iline[2]]: continue
         if sline[iline[0]] == 'R':
             nrunning += 1
             nrunning_cpus += int(sline[iline[1]])

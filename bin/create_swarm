@@ -120,6 +120,9 @@ use_torn_regions = args['use_torn_regions']
 use_exclude_regions = args['use_exclude_regions']
 indexing = args['indexing'][0]
 
+# fixed params not exposed
+swarm_glob = '*_*_*_*.o'
+
 if len(fns_remap) == 1 and os.path.isdir(fns_remap[0]):
     # assume this is the mrolling format and automatically use the double underscore file
     #   to get the information for this submission
@@ -249,14 +252,18 @@ if nfns_remap > 0:
             else:
                 fn_remap_swarm_dir = fn_remap_swarm_dirs[x]
             if len(remap_swarm_ids) == 0:
-                with open(os.path.join(fn_remap_swarm_dir, 'job_id.txt'), "r") as jobfile:
-                    remap_swarm_id = int(jobfile.read())
+                job_id_fn = os.path.join(fn_remap_swarm_dir, 'job_id.txt')
+                if os.path.isfile(job_id_fn):
+                    with open(job_id_fn) as jobfile:
+                        remap_swarm_id = int(jobfile.read())
+                else:
+                    remap_swarm_id = 0
             else:
                 remap_swarm_id = remap_swarm_ids[x]
 
             if len(remap_cmds_per_job) == 1:
                 if remap_cmds_per_job[0] < 1:
-                    oswarms = glob.glob(os.path.join(fn_remap_swarm_dir, 'swarm_*.o'))
+                    oswarms = glob.glob(os.path.join(fn_remap_swarm_dir, swarm_glob))
                     noswarms = len(oswarms); cnt = 0
                     sub_jobs = np.zeros(noswarms, dtype=np.int16)
                     for i in range(noswarms):
@@ -303,21 +310,26 @@ if nfns_remap > 0:
                     k += 1; nswarms += 1; i = k//cremap_cmds_per_job; j = k%cremap_cmds_per_job
 
                     if remap_use_error_swarm:
-                        swarm_fn = os.path.join(fn_remap_swarm_dir, 'swarm_{}_{}_{}.e'.format(remap_swarm_id,i,j))
-                        iserr = os.path.isfile(swarm_fn) and (os.path.getsize(swarm_fn) > 0)
+                        #swarm_fn = os.path.join(fn_remap_swarm_dir, 'swarm_{}_{}_{}.e'.format(remap_swarm_id,i,j))
+                        swarm_fn = os.path.join(fn_remap_swarm_dir, '*_{}_{}_{}.e'.format(remap_swarm_id,i,j))
+                        swarm_fn = glob.glob(swarm_fn)
+                        iserr = len(swarm_fn) < 1 or not os.path.isfile(swarm_fn[0]) or \
+                                (os.path.getsize(swarm_fn[0]) > 0)
                     else:
-                        swarm_fn = os.path.join(fn_remap_swarm_dir, 'swarm_{}_{}_{}.o'.format(remap_swarm_id,i,j))
+                        #swarm_fn = os.path.join(fn_remap_swarm_dir, 'swarm_{}_{}_{}.o'.format(remap_swarm_id,i,j))
+                        swarm_fn = os.path.join(fn_remap_swarm_dir, '*_{}_{}_{}.o'.format(remap_swarm_id,i,j))
+                        swarm_fn = glob.glob(swarm_fn)
                         if fns_remap_custom:
-                            iserr = False
+                            iserr = len(swarm_fn) < 1 or not os.path.isfile(swarm_fn[0])
                             # grep the whole swarm output file for the custom message
-                            if os.path.isfile(swarm_fn):
-                                with open(swarm_fn, 'r') as f:
+                            if not iserr:
+                                with open(swarm_fn[0], 'r') as f:
                                     for sline in f.readlines():
                                         if fns_remap_custom in sline:
                                             iserr = True; break
                         else:
-                            iserr = not os.path.isfile(swarm_fn) or 'Twas brillig, and the slithy toves' not in \
-                                    ''.join(list(tail(swarm_fn)))
+                            iserr = len(swarm_fn) < 1 or not os.path.isfile(swarm_fn[0]) or \
+                                    'Twas brillig, and the slithy toves' not in ''.join(list(tail(swarm_fn[0])))
                     if iserr:
                         error_cnt += 1
                         print(line, file=outfile)
