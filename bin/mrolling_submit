@@ -291,5 +291,5 @@ if [ -n "$do_wait" ]; then
   wait
 fi
 
-# in case this was submitted as a job
+# for legacy job completion checking (grepping stdout files for the special message)
 echo Twas brillig, and the slithy toves

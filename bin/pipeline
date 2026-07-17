@@ -5,7 +5,7 @@
 # xxx - did not feel like messing with DAGs, so workflow file needs to be topologically sorted by dependencies
 
 # workflow file is whitespace separated (no spaces within fields), single step per line:
-#   step_name comma_separated_dependencies_(step_names) swarm_file_without_date_prepended_and_without_.swarm_appended partition[/partition...] num_procs_per_node[/num_procs_per_node...] num_gpus[/num_gpus...] job_time_hours[/job_time_hours...] slurm_packing[/slurm_packing...] mroll_chunk_size [optional max running] [optional inline comments]
+#   step_name comma_separated_dependencies_(step_names) swarm_file_without_date_prepended_and_without_.swarm_appended partition[/partition...] num_procs_per_node[/num_procs_per_node...] num_gpus[/num_gpus...] job_time_hours[/job_time_hours...] slurm_packing[/slurm_packing...] mroll_chunk_size [optional max running] [optional node_split] [optional inline comments]
 # single comma for comma_separated_dependencies indicates no dependency
 # comment lines allowed starting with #, blank lines allowed
 
@@ -18,6 +18,8 @@ import shlex
 import subprocess
 import socket
 import shutil
+
+from sslock import parse_job_completed, sslock_fn_special, sslock_msg_special
 
 # https://stackoverflow.com/questions/3503719/emulating-bash-source-in-python
 def source(fn):
@@ -75,13 +77,15 @@ parser.add_argument('--mock-run', dest='mock_run', action='store_true',
     help='mock run, only print commands, do not run')
 parser.add_argument('--force', dest='force', action='store_true',
     help='send force flag to rolling_submit')
+parser.add_argument('--logs', dest='no_logs', action='store_false',
+    help='run with logs for non-top jobs (default no logs)')
 parser.add_argument('--validate', dest='validate', action='store_true',
     help='check a previous run to validate true completion (special message)')
 parser.add_argument('--job-hist', dest='job_hist', action='store_true',
     help='run jobhist on each step (saves jobhist.txt)')
 parser.add_argument('--cancel', dest='cancel', action='store_true',
     help='cancel jobs started by pipeline (bounded by start-at / stop-at)')
-parser.add_argument('--use-partitions', nargs='+', type=str, default=[''],
+parser.add_argument('--use-partitions', nargs='+', type=str, default=[],
     help='if possible force partition, first only with pack, all with no pack')
 parser.add_argument('--dependencies', nargs='*', type=int, default=[],
     help='jobs ids to add as "baseline" dependencies')
@@ -91,10 +95,18 @@ parser.add_argument('--mroll-all', dest='mroll_all', action='store_true',
     help='swarm multiple partition submission using mroll with packing')
 parser.add_argument('--no-mroll-roll', dest='mroll_roll', action='store_false',
     help='submit all mroll jobs, default is to only submit when none pending')
-parser.add_argument('--no-pack', dest='arg_pack', action='store_false',
-    help='do not pack any do not care pack values (0), use slurm packing)')
+#parser.add_argument('--no-pack', dest='arg_pack', action='store_false',
+#    help='do not pack any do not care pack values (0), use slurm packing)')
+parser.add_argument('--pack', dest='arg_pack', action='store_true',
+    help='pack any do not care pack values (0), use swarm packing)')
 parser.add_argument('--override-time', nargs=1, type=str, default=[''],
     help='use this runtime for all job submissions (for test)')
+parser.add_argument('--qos', nargs=1, type=str, default=[''],
+    help='specify this qos for submissions')
+parser.add_argument('--sleep-time', nargs=1, type=int, default=[30],
+    help='slurm queue polling time for mrolling submissions')
+parser.add_argument('--mroll-lfactor', nargs=1, type=int, default=[42],
+    help='scaling factor for mroll cutoff, ~nnodes pending')
 args = parser.parse_args()
 args = vars(args)
 
@@ -103,9 +115,10 @@ workflow_file = args['workflow_file'][0]
 start_at = args['start_at'][0]
 stop_at = args['stop_at'][0]
 date_str = args['date_str'][0]
-no_run = args['no_run']
+arg_no_run = args['no_run']
 force = args['force']
 validate = args['validate']
+no_logs = args['no_logs']
 job_hist = args['job_hist']
 cancel = args['cancel']
 mock_run = args['mock_run']
@@ -115,22 +128,30 @@ mroll_all = args['mroll_all']
 mroll_roll = args['mroll_roll']
 arg_pack = args['arg_pack']
 override_time = args['override_time'][0]
+qos = args['qos'][0]
+sleep_time = args['sleep_time'][0]
+mroll_lfactor = args['mroll_lfactor'][0]
 
 # fixed params not exposed
 slurm_excludes = '/gpfs/soma_fs/cne/.slurm'
 swarm_glob = '*_*_*_*.o'
+fn_special = sslock_fn_special
+fn_job_id = 'job_id.txt'
+# sleep time (s) for mrolling submisssions
+#sleep_time = 30
 
 # xxx - gah, cluster-specific
 #   max array size could be queried automatically, but we have cluster-dependent code here anyways
 hostname = socket.gethostname()
 if hostname.startswith('soma'):
     mroll_partitions = 'CPU-interactive,GPU-interactive'
-    mroll_pack_str = '-pt 48,48'
+    mroll_pack_str = '-pt 40,20'
     max_array = 500001
-    mroll_time = 120
-    # xxx - ultimately this needs to be dynamic somehow, punt for now.
-    #qos = 'cpu-72c'
-    qos = ''
+    mroll_time = 336
+    # define order in which partitions are preferred if --use-partitions is not specified
+    default_use_partitions = ['CPU-72c', 'CPU', 'GPU']
+    #prefer = '8360Y&cpu'
+    prefer = ''
 elif hostname.startswith('axon'):
     #mroll_partitions = 'p.axon,p.gpu'
     mroll_partitions = 'p.gpu' # more common use case, xxx - add another param?
@@ -138,12 +159,19 @@ elif hostname.startswith('axon'):
     mroll_pack_str = '-pt 20'
     max_array = 100001
     mroll_time = 24
-    qos = ''
+    # define order in which partitions are preferred if --use-partitions is not specified
+    default_use_partitions = ['p.axon', 'p.gpu']
+    prefer = ''
+elif hostname.startswith('raven'):
+    mroll_partitions = 'small'
+    mroll_pack_str = '-pt 72'
+    max_array = 30001
+    mroll_time = 24
+    # define order in which partitions are preferred if --use-partitions is not specified
+    default_use_partitions = ['general', 'gpu']
+    prefer = ''
 else:
     assert(False) # add settings for cluster for submitting small control jobs
-
-# sleep time (s) for mrolling submisssions
-sleep_time = 30
 
 # variables computed from argparse vars
 if date_str.lower() == 'none':
@@ -152,6 +180,12 @@ elif not date_str:
     date_str = date.today().strftime('%Y%m%d-')
 if date_str is not None and date_str[-1] != '-':
     date_str += '-'
+
+if len(use_partitions) == 0:
+    use_partitions = default_use_partitions
+    use_partitions = [x.lower() for x in use_partitions]
+
+no_run = arg_no_run
 
 # inits
 if os.path.isfile(slurm_excludes): source(slurm_excludes)
@@ -163,7 +197,7 @@ started = False
 last_deps = []
 with open(workflow_file, 'r') as f:
     for line in f:
-        sline = line.strip()
+        sline = line.strip().split('#')[0]
         if not sline or sline[0]=='#': continue
         cmd_no += 1
         sline = sline.split()
@@ -180,7 +214,8 @@ with open(workflow_file, 'r') as f:
         list_times = [int(x) for x in sline[6].split('/')]
         list_ipacks = [int(x) for x in sline[7].split('/')]
         chunk_size = int(sline[8])
-        use_maxrunning = maxrunning = int(sline[9]) if len(sline) > 9 and isInt_str(sline[9]) else 0
+        list_maxrunning = [int(x) for x in sline[9].split('/')] if len(sline) > 9 else [0]
+        list_psplits = [int(x) for x in sline[10].split('/')] if len(sline) > 10 else [0]
         npartitions  = len(lpartitions)
 
         # if only one value is specified for any of the '/' delimited options,
@@ -194,14 +229,27 @@ with open(workflow_file, 'r') as f:
                 list_times = [list_times[0] for x in range(npartitions)]
             if len(list_ipacks) == 1:
                 list_ipacks = [list_ipacks[0] for x in range(npartitions)]
+            if len(list_maxrunning) == 1:
+                list_maxrunning = [list_maxrunning[0] for x in range(npartitions)]
+            if len(list_psplits) == 1:
+                list_psplits = [list_psplits[0] for x in range(npartitions)]
+
+        # automatically divide out relevant fields if psplit is specified
+        if any([x > 0 for x in list_psplits]):
+            for p,i in zip(lpartitions, range(npartitions)):
+                if list_psplits[i] > 0:
+                    list_nprocs[i] = list_nprocs[i] // list_psplits[i]
+                    list_ngpus[i] = list_ngpus[i] // list_psplits[i]
 
         # change the parallel lists into dictionaries for easier lookup.
-        nprocs = {}; ngpus = {}; times = {}; ipacks = {}
+        nprocs = {}; ngpus = {}; times = {}; ipacks = {}; maxrunning = {}; psplits = {}
         for p,i in zip(lpartitions, range(npartitions)):
             nprocs[p] = list_nprocs[i]
             ngpus[p] = list_ngpus[i]
             times[p] = list_times[i]
             ipacks[p] = list_ipacks[i]
+            maxrunning[p] = list_maxrunning[i]
+            psplits[p] = list_psplits[i]
 
         # this is to support use_partition
         sel_lpartitions = [x in use_partitions for x in lpartitions] if use_partitions[0] else [True]*npartitions
@@ -224,15 +272,19 @@ with open(workflow_file, 'r') as f:
         nproc = nprocs[cuse_partition]
         ngpu = ngpus[cuse_partition]
         time = times[cuse_partition]
+        psplit = psplits[cuse_partition]
+        use_maxrunning = list_maxrunning[0]
+        max_maxrunning = max(list_maxrunning)
+        max_psplit = max(list_psplits)
 
         # mrolling mode (chunk_size > 0), uses mrolling_submit that allows for multiple partition rolling submissions
         use_mroll = (chunk_size > 0)
         wait_str = '-W' if use_mroll else ''
-        assert( not use_mroll or maxrunning < chunk_size ) # need maxrunning < chunk_size for mrolling_submit
+        assert( not use_mroll or max_maxrunning < chunk_size ) # need maxrunning < chunk_size for mrolling_submit
 
         # nopack (bool) means to not have swarm do the packing, but allow slurm to do it.
-        # (i)pack (from pipeline file) interacts with command line arg --no-pack
-        # ipack == 0 (do not care), jobs are packed by default, not packed (slurm packing) if --no-pack specified
+        # (i)pack (from pipeline file) interacts with command line arg --pack
+        # ipack == 0 (do not care), jobs are packed or not packed (slurm packing) depending on CLI
         # ipack == 1, jobs are always packed
         # ipack == -1, jobs are never packed (slurm packing)
         # packing option can be specified per partition, but only if using mroll.
@@ -241,8 +293,9 @@ with open(workflow_file, 'r') as f:
         any_must_pack = any([x > 0 for x in list_ipacks])
         use_mixed_mroll = \
                 (any_must_not_pack and any_must_pack) or \
-                (arg_pack and any_must_not_pack) or \
-                (not arg_pack and any_must_pack)
+                (arg_pack and any_must_not_pack) #or \
+                # commented to allow mroll_all mode to submit to multiple partitions with packing/splitting
+                #(not arg_pack and any_must_pack)
         # default is to have all the jobs follow pack / nopack if any ipack is nonzero
         ipack = -1 if any_must_not_pack else (1 if any_must_pack else 0)
         nopack = (not arg_pack) if ipack == 0 else (ipack < 0)
@@ -253,6 +306,7 @@ with open(workflow_file, 'r') as f:
                 nopacks[k] = (not arg_pack) if ipacks[k] == 0 else (ipacks[k] < 0)
         else:
             assert( not (any_must_not_pack and any_must_pack) ) # mixed pack/nopack requires mroll
+        assert( not nopack or all([x == 0 for x in psplits.values()]) ) # psplit needs packing
 
         if not started:
             if not start_at or name == start_at:
@@ -261,12 +315,25 @@ with open(workflow_file, 'r') as f:
                 job_ids[name] = -1
                 continue
 
-        if (nopack and not use_mroll) or (use_mroll and not use_mixed_mroll and (nopack or mroll_all)):
+        # if packing, multiple partitions and same gpu / times are specified then automatically set mroll_all.
+        # this allows for packing along with submitting to multiple partitions (via slurm).
+        # the main use case is for splitting nodes (with packing) and submitting against all partitions via slurm.
+        if len(partitions) > 1 and \
+                all([x == ngpu for x in ngpus.values()]) and \
+                all([x == time for x in times.values()]):
+            mroll_all = True
+
+        if (not use_mroll and nopack) or (use_mroll and not use_mixed_mroll and (nopack or mroll_all)):
             # have to use packing in order to use gpus.
             # i.e., slurm can not allow jobs to share gpus (without cuda MPS management enabled).
-            assert( all([x == 0 for x in ngpus.values()])) # xxx - not allowed
+            assert( all([x == 0 for x in ngpus.values()]) )
             # without packing, all the wall times have to match
             assert( all([x == times[cuse_partition] for x in times.values()]) )
+
+        if use_mroll and mroll_all and all([x > 0 for x in psplits.values()]):
+            # for submitting packed/split jobs against multiple partitions using slurm,
+            #   adjust use_maxrunning depending on the packing
+            use_maxrunning = use_maxrunning // nproc
 
         # get the dependencies
         deps = [x for x in deps if x] if not last_deps else last_deps
@@ -304,6 +371,25 @@ with open(workflow_file, 'r') as f:
         # xxx - for now just static qos depending on the cluster
         qos_str = '--qos=' + qos if qos else ''
 
+        # try to steer jobs to a particular partition. not clear that slurm directly supports
+        #   preferring one partition over another without using features, or even better would
+        #   be a partition submission preference but *in order*, like CPU-72c, if not then CPU ..
+        prefer_str = '--prefer=\\"' + prefer + '\\"' if prefer else ''
+
+        # for running without log files for all the slurm/swarm processes.
+        # saves a lot of io and lots of inodes (plus reduces cleanup and validation time).
+        log_str = '--noout --noerr' if no_logs else ''
+
+        def _get_pack_and_exclusive_str(_nproc, _psplit):
+            _pack_str = '-p {}'.format(_nproc)
+            if _psplit > 0:
+                _pack_str += ' --psplit {}'.format(_psplit)
+            _exclusive_str = ''
+            if _psplit == 0:
+                _exclusive_str = '--exclusive' # always use exclusive node requests if we are packing, not splitting
+
+            return _pack_str, _exclusive_str
+
         # whether to have swarm pack or slurm pack multiple jobs per node
         if nopack:
             # if slurm packing is enabled and multiple partitions are specified:
@@ -320,13 +406,20 @@ with open(workflow_file, 'r') as f:
             else:
                 exclusive_str = ''
         else:
-            pack_str = '-p {}'.format(nproc)
-            spartition = ','.join(partitions) if use_mroll and mroll_all else partition
-            exclusive_str = '--exclusive' # always use exclusive node requests if we are packing
+            if use_mroll and mroll_all and all([x > 0 for x in psplits.values()]):
+                # this is for submitting packed/split jobs against multiple partitions using slurm
+                assert( all([x == nproc for x in nprocs.values()]) ) # have to split into equal portions
+                pack_str = '-p {}'.format(nproc)
+                pack_str += ' --psplit {}'.format(','.join([str(psplits[x]) for x in cuse_lpartitions]))
+                exclusive_str = ''
+                spartition = ','.join(cuse_partitions)
+            else:
+                pack_str, exclusive_str = _get_pack_and_exclusive_str(nproc, psplit)
+                spartition = ','.join(partitions) if use_mroll and mroll_all else partition
 
         def _swarm_opts():
-            opts = "\" --partition {} --sbatch ' --exclude={} {} {} {} {} ' {} {} ".format(spartition,
-                    exclude_str, gpu_str, dep_str, wait_str, qos_str, exclusive_str, pack_str)
+            opts = "\" --partition {} --sbatch ' --exclude={} {} {} {} {} {} ' {} {} {} ".format(spartition,
+                    exclude_str, gpu_str, dep_str, wait_str, qos_str, prefer_str, exclusive_str, pack_str, log_str)
             if override_time:
                 opts += " --time {} ".format(override_time)
             elif time > 0:
@@ -342,11 +435,12 @@ with open(workflow_file, 'r') as f:
             cmd += " --sleep_time {} --swarm_chunksize {}".format(sleep_time, chunk_size)
             if not use_mixed_mroll and (nopack or mroll_all):
                 if mroll_roll:
-                    njob_cutoff = 1
+                    njob_cutoff_roll = mroll_lfactor if max_psplit == 0 else mroll_lfactor*max_psplit
+                    njob_cutoff = 1 if use_maxrunning > 0 else njob_cutoff_roll
                 elif not nopack:
                     assert( all([x == nproc for x in nprocs.values()])) # need equal packing
+                    pack_str, exclusive_str = _get_pack_and_exclusive_str(nproc, psplit)
                     gpu_str = ''
-                    pack_str = '-p {}'.format(nproc)
                     njob_cutoff = max_array - 2*chunk_size - 1
                 else:
                     njob_cutoff = (max_array - 1)//npartitions - 2*chunk_size - 1
@@ -363,7 +457,9 @@ with open(workflow_file, 'r') as f:
                     # decided to size the cutoffs automatically based on the max array size.
                     # encouraged is to queue jobs as early as possible.
                     # but, mroll_roll allows for maxrunning even for mroll jobs.
-                    njob_cutoff = 1 if mroll_roll else (max_array - 1)//npartitions - 2*(chunk_size//nprocs[lp])
+                    njob_cutoff_roll = mroll_lfactor if psplits[lp] == 0 else mroll_lfactor*psplits[lp]
+                    njob_cutoff_noroll = (max_array - 1)//npartitions - 2*(chunk_size//nprocs[lp])
+                    njob_cutoff = njob_cutoff_roll if mroll_roll else njob_cutoff_noroll
                     njob_cutoff_str += "{}{}".format(' ' if i > 0 else '', njob_cutoff)
                     mspartition += "{}{}".format(' ' if i > 0 else '', p)
                     gpu_str = '--gres=gpu:{}'.format(ngpus[lp]) if ngpus[lp] > 0 else ''
@@ -373,8 +469,8 @@ with open(workflow_file, 'r') as f:
                         pack_str = '-pt {}'.format(nprocs[lp])
                         exclusive_str = ''
                     else:
-                        pack_str = '-p {}'.format(nprocs[lp])
-                        exclusive_str = '--exclusive' # always use exclusive node requests if we are packing
+                        pack_str, exclusive_str = _get_pack_and_exclusive_str(nprocs[lp], psplits[lp])
+                    use_maxrunning = maxrunning[lp]
                     swarm_opts += _swarm_opts()
                 njob_cutoff_str += "\""
                 mspartition += "\""
@@ -395,11 +491,14 @@ with open(workflow_file, 'r') as f:
             time = mroll_time
             spartition = mroll_partitions
             gpu_str = ''
+            qos_str = ''
             pack_str = mroll_pack_str
             wait_str = ''
             exclusive_str = ''
             use_maxrunning = 0
+            no_run = False
             swarm_name = 'top-' + swarm_name
+            log_str = ''
             cmd += (" --swarm_opts " + _swarm_opts())
             if force: cmd += ' --force '
         else:
@@ -411,10 +510,11 @@ with open(workflow_file, 'r') as f:
         if not (validate or cancel or job_hist):
             assert(os.path.isfile(swarm_file)) # swarm file missing
             job_id = echo_and_run(cmd, mock_run, cmd_no if no_run else -1)
+            no_run = arg_no_run
             print(); print(); print()
         else:
             subdir = '_' + (top_swarm if top_swarm else swarm_file)
-            fn = os.path.join(subdir, 'job_id.txt')
+            fn = os.path.join(subdir, fn_job_id)
             with open(fn, 'r') as jf:
                 for jline in jf:
                     cjline = jline.strip()
@@ -422,29 +522,72 @@ with open(workflow_file, 'r') as f:
                         job_id = int(cjline)
                         print('\tjobid = {}'.format(job_id))
             if validate:
-                expected = count_swarm_lines(os.path.join(subdir,swarm_file)) + (1 if top_swarm else 0)
-                # can not use glob/grep because around 10000 or so args gets too long.
-                args = shlex.split("find {} -name '{}' -print -quit".\
-                        format(os.path.join(os.getcwd(), subdir), swarm_glob))
-                find = subprocess.Popen(args, stdout=subprocess.PIPE)
-                swarm_o0 = [y for y in [x.decode().strip() for x in find.communicate() if x] if y]
-                if len(swarm_o0) > 0:
-                    # the usual backslash before the semicolon in the find command
-                    #   is not needed b/c this does not through bash.
-                    args = shlex.split("find {} -name '{}' -exec tail {{}} ;".\
-                            format(os.path.join(os.getcwd(), subdir), swarm_glob))
+                fn = os.path.join(subdir,swarm_file)
+                if os.path.isfile(fn):
+                    expected = count_swarm_lines(os.path.join(subdir,swarm_file))
+                    if top_swarm and not no_logs: expected += 1
+                    # can not use glob/grep because around 10000 or so args gets too long.
+                    if no_logs:
+                        # find all the special serialized files with job completion statuses
+                        args = shlex.split("find {} -name '{}' -print".\
+                                format(os.path.join(os.getcwd(), subdir), fn_special))
+                    else:
+                        # find the first log file, find over all log files done below incase no log files are found
+                        args = shlex.split("find {} -name '{}' -print -quit".\
+                                format(os.path.join(os.getcwd(), subdir), swarm_glob))
                     find = subprocess.Popen(args, stdout=subprocess.PIPE)
-                    args = ['grep', 'Twas brillig, and the slithy toves']
-                    grep = subprocess.Popen(args, stdin=find.stdout, stdout=subprocess.PIPE)
-                    find.stdout.close()
-                    args = ['wc', '-l']
-                    wc = subprocess.Popen(args, stdin=grep.stdout, stdout=subprocess.PIPE)
-                    grep.stdout.close()
-                    output = wc.communicate()[0]
-                    actual = int(output)
+                    swarm_o0 = [y for y in [x.decode().strip() for x in find.stdout if x] if y]
+                    find.communicate()
                 else:
+                    expected = 0
+                    swarm_o0 = []
+                if len(swarm_o0) > 0:
+                    if no_logs:
+                        swarm_o0.sort()
+                        actual = 0
+                        for cfn_special in swarm_o0:
+                            cfn_job_id = os.path.join(os.path.dirname(cfn_special), fn_job_id)
+                            try:
+                                _, _, _, string_ids = parse_job_completed(cfn_job_id, cfn_special)
+                                cactual, corrupted = len(string_ids), False
+                            except:
+                                cactual, corrupted = 0, True
+                            actual += cactual
+                            if len(swarm_o0) > 13: print(f'\t{cfn_special=} {cactual=}')
+                            #print(f'\t{cfn_special=} {cactual=}')
+                            if corrupted: print(f'\tDILL CORRUPTED!!!!! {cfn_special=} {cactual=}')
+                    else:
+                        if expected > 10000: print(f'\t{expected=}')
+                        # the usual backslash before the semicolon in the find command
+                        #   is not needed b/c this does not through bash.
+                        args = shlex.split("find {} -name '{}' -exec tail {{}} ;".\
+                                format(os.path.join(os.getcwd(), subdir), swarm_glob))
+                        find = subprocess.Popen(args, stdout=subprocess.PIPE)
+                        args = ['grep', sslock_msg_special]
+                        grep = subprocess.Popen(args, stdin=find.stdout, stdout=subprocess.PIPE)
+                        find.stdout.close()
+                        # use awk to show progress for very large jobsets (if swarms are 100k+ lines)
+                        #args = ['wc', '-l']
+                        # buffering in the pipes makes this not work so great as a progress bar.
+                        # to get around this run the pipeline command but prefaced with:
+                        #     stdbuf -i0 -o0 -e0
+                        args = shlex.split("awk 'BEGIN{start=systime()} {if (NR % 10000 == 0) {now=systime(); elapsed=now-start; print \"Count: \" NR \", Elapsed time: \" elapsed \" s\"}}END{print NR}'")
+                        wc = subprocess.Popen(args, stdin=grep.stdout, stdout=subprocess.PIPE)
+                        grep.stdout.close()
+                        output='0'
+                        for line in wc.stdout:
+                            sline = line.decode().strip()
+                            if not sline or sline[0]=='#': continue
+                            output = sline
+                            if not isInt_str(output):
+                                print('\t{}'.format(output))
+                        wc.communicate()
+                        #output = wc.communicate()[0]
+                        actual = int(output)
+                    # else if no_logs:
+                else: # if len(swarm_o0) > 0:
                     actual = 0
-                status_str = 'OK' if expected == actual else 'ERRORS!'
+                status_str = 'OK' if expected > 0 and expected == actual else 'ERRORS!'
                 print('\t{} {} expected, {} actual'.format(status_str, expected, actual))
             elif cancel:
                 cmd = 'scancel {}'.format(job_id)

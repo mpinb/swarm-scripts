@@ -13,6 +13,7 @@ Array jobs are the easiest slurm method for bundling multiple related jobs. Typi
 - python3
   - numpy
   - python-dateutil
+  - sslock [MPINB]
 - slurm
 
 NOTE: None of the toolchain has been tested using any other shell besides bash. Some things likely will break.
@@ -36,7 +37,7 @@ export SWARMDIR=${SCRATCH}/swarm
 export DELDIR=${SCRATCH}/.to_delete
 
 # clears all the swarm command files and logs, must be done periodically
-alias swarmc="mkdir -p $DELDIR; mv $SWARMDIR $DELDIR; mkdir -p $SWARMDIR/logs; nohup rm -rf $DELDIR/swarm >/dev/null 2>&1 &"
+alias swarmc="mkdir -p $DELDIR $SWARMDIR; mv $SWARMDIR $DELDIR; mkdir -p $SWARMDIR/logs; nohup rm -rf $DELDIR/swarm >/dev/null 2>&1 &"
 ```
 
 After modifying `.bashrc` or `.bash_profile`, either re-`source` it or log out and back in.
@@ -44,6 +45,7 @@ After modifying `.bashrc` or `.bash_profile`, either re-`source` it or log out a
 You need python3 with a few basic modules (i.e., anaconda3 would work). If you do not have this you can create a conda environment that would work (after installing miniconda), for example:
 ```
 conda create -y --name swarm numpy python-dateutil
+pip install git+ssh://git@github.com/mpinb/sslock.git
 ```
 
 ## Getting Started / Short Tutorial
@@ -62,6 +64,8 @@ mkdir -p $SCRATCH/batches
 cd $SCRATCH/batches
 ```
 Scratch is preferred because typically scratch is not backed up, and a use case in which these batch log files need to be backed up is unlikely.
+
+IMPORTANT: Unfortunately there are a couple cluster-dependent switches in `aswarm` and `pipeline`. Search for `hostname` in these files and modify appropriately.
 
 ### Run some test jobs using the swarm toolchain
 
@@ -127,10 +131,6 @@ jobhist .
 ```
 This creates a file in each subdirectory called `jobhist.txt` that contains the `sacct` information and the `swarm` and `sbatch` command lines for each array job. Alternatively one can show the job history for a specific job with `jobhist <jobid>`. For convenience job ids are stored in each directory created by `rolling_submit` (called by `pipeline`) in a file called `job_id.txt`.
 
-Clean up your log files periodically (again to not waste inode space):
-```
-tar_swarms . --verbose
-```
 
 ## Manifest
 
@@ -140,7 +140,6 @@ bash
   - aswarm
   - mrolling_submit
   - rolling_submit
-  - tar_swarms
 
 perl
   - batchlim *
@@ -172,4 +171,3 @@ Utility tools (not part of the submission hierarchy):
   - jobhist
   - freen
   - batchlim
-  - tar_swarms

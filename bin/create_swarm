@@ -10,6 +10,8 @@ import numpy as np
 from collections import deque
 import glob
 import subprocess
+import time
+import re
 
 try:
     from def_common_params import order_txt_fn_str, get_paths, all_wafer_ids, total_nwafers
@@ -17,10 +19,34 @@ try:
 except ModuleNotFoundError:
     print('WARNING: no def_common_params (no msem data support)')
 
+from sslock import parse_job_completed, sslock_fn_special, sslock_msg_special
+
 # https://stackoverflow.com/questions/1265665/how-can-i-check-if-a-string-represents-an-int-without-using-try-except
 def isInt_str(v):
     v = str(v).strip()
     return v=='0' or (v if v.find('..') > -1 else v.lstrip('-+').rstrip('0').rstrip('.')).isdigit()
+
+# Chat GPT generated
+def most_frequent_string(string_list):
+    # Check if the list is empty
+    if not string_list:
+        return None
+
+    # Create a dictionary to count occurrences of each string
+    count_dict = {}
+    for string in string_list:
+        if string in count_dict:
+            count_dict[string] += 1
+        else:
+            count_dict[string] = 1
+
+    # Find the string with the maximum number of occurrences
+    max_count = max(count_dict.values())
+    most_frequent = [key for key, value in count_dict.items() if value == max_count]
+
+    # Return the first string with the maximum number of occurrences
+    # If there are multiple, this returns one of them
+    return most_frequent[0]
 
 parser = argparse.ArgumentParser(description='run_create_swarm.py')
 parser.add_argument('--wafer_ids', nargs='*', type=int, default=[],
@@ -87,6 +113,8 @@ parser.add_argument('--fn-remap-swarm-dirs', nargs='*', type=str, default=[],
     help='specify location of previous swarm outputs (default _<fn_remap>)')
 parser.add_argument('--remap-use-error-swarm', dest='remap_use_error_swarm', action='store_true',
     help='use non-empty swarm error file instead of special message')
+parser.add_argument('--remap-logs', dest='no_logs', action='store_false',
+    help='grep output logs instead of checking job completion dill')
 args = parser.parse_args()
 args = vars(args)
 
@@ -119,14 +147,18 @@ fns_remap_custom = args['fns_remap_custom'][0]
 use_torn_regions = args['use_torn_regions']
 use_exclude_regions = args['use_exclude_regions']
 indexing = args['indexing'][0]
+no_logs = args['no_logs']
 
 # fixed params not exposed
 swarm_glob = '*_*_*_*.o'
+fn_special = sslock_fn_special
+fn_job_id = 'job_id.txt'
 
 if len(fns_remap) == 1 and os.path.isdir(fns_remap[0]):
     # assume this is the mrolling format and automatically use the double underscore file
     #   to get the information for this submission
     mroll_swarm_fn = os.path.join(fns_remap[0], '_' + fns_remap[0])
+    print(mroll_swarm_fn)
     assert( os.path.isfile(mroll_swarm_fn) ) # this is only meant for mrolling_submit submissions
     mroll_dn = fns_remap[0].split(os.sep)[-1]
     mroll_bn = os.path.splitext(mroll_dn)[0]
@@ -187,8 +219,10 @@ else:
     valid_iterate_range = (iterate_ranges[0] > -1).all()
     if valid_iterate_range and (iterate_ranges[:,1] - iterate_ranges[:,0] < 1).any():
         with open(fn, "w") as outfile:
-            outfile.write("echo noop, Twas brillig, and the slithy toves\n")
-        print("At least one range empty, writing noop swarm file")
+            #outfile.write("echo noop, {}\n".format(sslock_msg_special))
+            outfile.write(" ")
+        #print("At least one range empty, writing noop swarm file")
+        print("At least one range empty, writing empty swarm file")
         sys.exit()
     iterate_ranges = [iterate_ranges.copy() for x in range(nwafer_ids if nwafer_ids > 0 else 1)]
 valid_iterate_range = (iterate_ranges[0] > -1).all()
@@ -200,6 +234,8 @@ else:
 
 beg_args = [x.strip() for x in beg_args]
 end_args = [x.strip() if x is not None else None for x in end_args]
+
+remap_ext = '.e' if remap_use_error_swarm else '.o'
 
 def _get_unrolled_iterate_ranges(iwafer):
     # add the slice iteration to the dimensions to iterate
@@ -229,11 +265,25 @@ def _get_unrolled_iterate_ranges(iwafer):
 # https://docs.python.org/2/library/collections.html#deque-recipes
 def tail(filename, n=10):
     'Return the last n lines of a file'
-    return deque(open(filename), n)
+    #return deque(open(filename), n)
+    # how did they have a legit example that leaks a file descriptor?
+    with open(filename) as f:
+        return deque(f, n)
+
+# chat gpt generated
+def find_longest_match(string, patterns):
+    longest_match = None
+    max_length = 0
+    for pattern in patterns:
+        if string.startswith(pattern) and len(pattern) > max_length:
+            longest_match = pattern
+            max_length = len(pattern)
+    return longest_match
 
 if nfns_remap > 0:
     # this is just for re-running error jobs, works along with success message in output
     #   and by default uses the rolling_submit job_id/swarm_subdir format.
+    # new mode added for log-less mechanism for reporting jobs finished in serialized file.
 
     # if it's a single argument, check for a glob
     if nfns_remap == 1:
@@ -243,19 +293,25 @@ if nfns_remap > 0:
 
     error_cnt = 0; error_jobs = []; nswarms = 0
     with open(fn, "w") as outfile:
+        start_t = dt = time.time()
         for fn_remap,x in zip(fns_remap, range(nfns_remap)):
             print(fn_remap)
+
             if len(fn_remap_swarm_dirs) == 0:
                 tmp = fn_remap.split(os.sep)
                 tmp[-1] = '_' + tmp[-1]
                 fn_remap_swarm_dir = os.sep.join(tmp)
             else:
                 fn_remap_swarm_dir = fn_remap_swarm_dirs[x]
+
             if len(remap_swarm_ids) == 0:
                 job_id_fn = os.path.join(fn_remap_swarm_dir, 'job_id.txt')
                 if os.path.isfile(job_id_fn):
                     with open(job_id_fn) as jobfile:
-                        remap_swarm_id = int(jobfile.read())
+                        try:
+                            remap_swarm_id = int(jobfile.read())
+                        except:
+                            remap_swarm_id = 0
                 else:
                     remap_swarm_id = 0
             else:
@@ -263,6 +319,7 @@ if nfns_remap > 0:
 
             if len(remap_cmds_per_job) == 1:
                 if remap_cmds_per_job[0] < 1:
+                    assert( not no_logs ) # have to specify remap_cmds_per_job if running log-less
                     oswarms = glob.glob(os.path.join(fn_remap_swarm_dir, swarm_glob))
                     noswarms = len(oswarms); cnt = 0
                     sub_jobs = np.zeros(noswarms, dtype=np.int16)
@@ -272,22 +329,45 @@ if nfns_remap > 0:
                         if len(tmp) > 1 and isInt_str(tmp[-1]):
                             sub_jobs[cnt] = int(tmp[-1]); cnt += 1
                     cremap_cmds_per_job = sub_jobs.max() + 1
-                    print('cremap_cmds_per_job={}'.format(cremap_cmds_per_job))
                 else:
                     cremap_cmds_per_job = remap_cmds_per_job[0]
+                partition = None
+                print(f'\t{cremap_cmds_per_job=}')
             else:
                 fn_remap_jobhist = os.path.join(fn_remap_swarm_dir, 'jobhist.txt')
-                if os.path.isfile(fn_remap_jobhist):
-                    partition_str = '--partition'
+                if remap_swarm_id == 0:
+                    partition = 'none'
+                    cremap_cmds_per_job = 1
+                    use_sacct = False
+                elif os.path.isfile(fn_remap_jobhist):
+                    # xxx - this works, but in some instances (usually b/c of gpfs !*@#$) the swarm info
+                    #    might be missing, so instead parse the partition out of the first actual job history line.
+                    #partition_str = '--partition'
+                    pattern = re.compile(r'^\s*\d+_\d+')
                     partition = None
                     with open(fn_remap_jobhist, "r") as histfile:
                         for line in histfile:
-                            if partition_str in line:
-                                # first instance in the jobhist.txt file should be the swarm arg, --partition=
-                                partition = line[line.index(partition_str) + len(partition_str) + 1:].split()[0]
-                                break
-                    assert(partition is not None) # jobhist.txt found but partition not found in file
+                            #if partition_str in line:
+                            #    # first instance in the jobhist.txt file should be the swarm arg, --partition=
+                            #    partition = line[line.index(partition_str) + len(partition_str) + 1:].split()[0]
+                            #    break
+                            if pattern.match(line):
+                                columns = line.split()
+                                if len(columns) >= 2:
+                                    # the jobhist columns can run together (OUT_OF_MEMORY for example)
+                                    #   so needed this to find the longest match from partitions.
+                                    #   startswith by itself does not work because CPU-72c could match CPU.
+                                    partition = find_longest_match(columns[1], partitions)
+                                    if partition is not None: break
+                    #assert(partition is not None) # jobhist.txt found but partition not found in file
+                    # this is a backup if the jobhist does not contain the swarm info.
+                    #   this can happen for canceled jobs.
+                    use_sacct = (partition is None)
                 else:
+                    assert(False) # you forgot to run jobhist, or if necessary then comment this line, can be slow
+                    use_sacct = True
+
+                if use_sacct:
                     # this method is super slow, so try to avoid this if possible,
                     # for example, by running jobhist first so that jobhist.txt is present.
                     'sacct -n -j {} --format partition'.format(remap_swarm_id)
@@ -298,10 +378,31 @@ if nfns_remap > 0:
                                                     stderr=subprocess.PIPE,
                                                     encoding='utf8').communicate()
                     partition = sacct_output[0].split()[0]
-                cremap_cmds_per_job = remap_cmds_per_job[partitions.index(partition)]
+                if partition != 'none':
+                    cremap_cmds_per_job = remap_cmds_per_job[partitions.index(partition)]
+                print(f'\t{cremap_cmds_per_job=} {partition=}')
             # if len(remap_cmds_per_job) == 1:
 
-            # find all errors by checking output files for the "special message"
+            if partition == 'none':
+                pass
+            elif no_logs:
+                cfn_special = os.path.join(fn_remap_swarm_dir, fn_special)
+                if os.path.isfile(job_id_fn):
+                    _, _, _, string_ids = parse_job_completed(job_id_fn, cfn_special)
+                else:
+                    string_ids = None
+            else:
+                # do the glob once for all the stdout or stderr output files in the directory,
+                #   instead of for each line in the swarm file (which is painfully painfully slow).
+                swarm_fns = glob.glob(os.path.join(fn_remap_swarm_dir, '*' + remap_ext))
+                # remove subdir to speed up searching for swarm file name below
+                swarm_fns = [os.path.basename(x) for x in swarm_fns]
+                # this is needed because pipeline submissions change the swarm name to the pipeline step name
+                swarm_name = most_frequent_string([os.path.basename(x).split('_')[0] for x in swarm_fns])
+                if swarm_name is None: swarm_fns = []
+
+            # find all error jobs by checking output files,
+            #   either for the "special message" or for non-empty error files.
             with open(fn_remap, "r") as infile:
                 k = -1
                 for rline in infile:
@@ -309,35 +410,49 @@ if nfns_remap > 0:
                     if not line or line[0] == '#': continue
                     k += 1; nswarms += 1; i = k//cremap_cmds_per_job; j = k%cremap_cmds_per_job
 
-                    if remap_use_error_swarm:
-                        #swarm_fn = os.path.join(fn_remap_swarm_dir, 'swarm_{}_{}_{}.e'.format(remap_swarm_id,i,j))
-                        swarm_fn = os.path.join(fn_remap_swarm_dir, '*_{}_{}_{}.e'.format(remap_swarm_id,i,j))
-                        swarm_fn = glob.glob(swarm_fn)
-                        iserr = len(swarm_fn) < 1 or not os.path.isfile(swarm_fn[0]) or \
-                                (os.path.getsize(swarm_fn[0]) > 0)
+                    if partition == 'none':
+                        iserr = True
+                    elif no_logs:
+                        cstring_id = '{}_{}_{}'.format(remap_swarm_id, i, j)
+                        iserr = string_ids is None or cstring_id not in string_ids
                     else:
-                        #swarm_fn = os.path.join(fn_remap_swarm_dir, 'swarm_{}_{}_{}.o'.format(remap_swarm_id,i,j))
-                        swarm_fn = os.path.join(fn_remap_swarm_dir, '*_{}_{}_{}.o'.format(remap_swarm_id,i,j))
-                        swarm_fn = glob.glob(swarm_fn)
-                        if fns_remap_custom:
-                            iserr = len(swarm_fn) < 1 or not os.path.isfile(swarm_fn[0])
-                            # grep the whole swarm output file for the custom message
-                            if not iserr:
-                                with open(swarm_fn[0], 'r') as f:
-                                    for sline in f.readlines():
-                                        if fns_remap_custom in sline:
-                                            iserr = True; break
-                        else:
+                        swarm_fn = '{}_{}_{}_{}{}'.format(swarm_name, remap_swarm_id, i, j, remap_ext)
+                        # add the subdir back, if the file was found in the list of swarms files in this subdir
+                        swarm_fn = [os.path.join(fn_remap_swarm_dir, swarm_fn)] if swarm_fn in swarm_fns else []
+
+                        if remap_use_error_swarm:
+                            # special mode to flag as error runs any runs with non-empty stderr output files.
                             iserr = len(swarm_fn) < 1 or not os.path.isfile(swarm_fn[0]) or \
-                                    'Twas brillig, and the slithy toves' not in ''.join(list(tail(swarm_fn[0])))
+                                    (os.path.getsize(swarm_fn[0]) > 0)
+                        else:
+                            if fns_remap_custom:
+                                # rare use case, specify a custom special message.
+                                iserr = len(swarm_fn) < 1 or not os.path.isfile(swarm_fn[0])
+                                # grep the whole swarm output file for the custom message
+                                if not iserr:
+                                    with open(swarm_fn[0], 'r') as f:
+                                        for sline in f.readlines():
+                                            if fns_remap_custom in sline:
+                                                iserr = True; break
+                            else:
+                                # the normal special message should occur at
+                                #   or close to the end of the stdout output file.
+                                iserr = len(swarm_fn) < 1 or not os.path.isfile(swarm_fn[0]) or \
+                                        sslock_msg_special not in ''.join(list(tail(swarm_fn[0])))
+                    # else: - if no_logs:
                     if iserr:
                         error_cnt += 1
                         print(line, file=outfile)
                         error_jobs += ['{}-{}_{}'.format(fn_remap,i,j)]
+                #for rline in infile:
+            #with open(fn_remap, "r") as infile:
+
+            print('\tellapsed {:.1f} s, loop time {:.1f} s'.format(time.time() - start_t, time.time() - dt))
+            dt = time.time()
         #for fn_remap,x in zip(fns_remap, range(nfns_remap)):
     #with open(fn, "w") as outfile:
 
-    print(error_jobs)
+    #print(error_jobs)
     print('Wrote {} error lines out of {} lines in swarm(s) to output swarm'.format(error_cnt,nswarms))
     print(fn) # for easy awk mangling of output if necessary (gpus for example)
     sys.exit()

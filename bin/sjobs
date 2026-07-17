@@ -95,7 +95,11 @@ else:
     if not summary:
         for line in result:
             sline = line.split()
-            if pending_no_deps and 'Dependency' in sline[iline[2]]: continue
+            # adjust this in two places, search JobHeldUser
+            # NOT stop if jobs are held
+            #if pending_no_deps and ('Dependency' in sline[iline[2]] or 'JobHeldUser' in sline[iline[2]]): continue
+            # stop if jobs are held
+            if pending_no_deps and ('Dependency' in sline[iline[2]]): continue
             print(line)
 
     # need pending array jobs unrolled to get corect count
@@ -106,7 +110,11 @@ else:
     nrunning_cpus = npending_cpus = 0
     for line in result[1:]:
         sline = line.split()
-        if pending_no_deps and 'Dependency' in sline[iline[2]]: continue
+        # adjust this in two places, search JobHeldUser
+        # NOT stop if jobs are held
+        #if pending_no_deps and ('Dependency' in sline[iline[2]] or 'JobHeldUser' in sline[iline[2]]): continue
+        # stop if jobs are held
+        if pending_no_deps and ('Dependency' in sline[iline[2]]): continue
         if sline[iline[0]] == 'R':
             nrunning += 1
             nrunning_cpus += int(sline[iline[1]])

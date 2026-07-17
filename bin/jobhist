@@ -8,6 +8,8 @@ jobhist - A script that will output historical information about users' jobs on
 
 import argparse
 import subprocess
+import signal
+import os
 import shlex
 import os.path
 import datetime as dt
@@ -38,6 +40,13 @@ SBATCHLOGFILE = "sbatch.log"
 SBATCHARCHIVEDIR = os.path.join(LOGDIR, "sbatch_log_archives")
 SWARMLOGFILE = "swarm.log"
 SWARMARCHIVEDIR = os.path.join(LOGDIR, "swarm_log_archives")
+
+
+def make_jobhist_pipe_safe():
+    """Make jobhist work properly with Unix pipes like head, tail, grep."""
+    def handle_sigpipe(signum, frame):
+        sys.exit(0)
+    signal.signal(signal.SIGPIPE, handle_sigpipe)
 
 
 def print_header():
@@ -327,8 +336,125 @@ def call_sacct(jobid):
     return jobinfo, jobinfo_batch
 
 
-def display_jobhist_sacct(jobinfo, jobinfo_batch):
-    """ Print jobhist information from sacct. """
+def format_time_duration(seconds):
+    """Convert seconds to human-readable format."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        return f"{seconds/60:.1f}m"
+    else:
+        return f"{seconds/3600:.2f}h"
+
+def create_runtime_histogram(all_times, bins=20, max_width=60):
+    """
+    Create an ASCII histogram of job runtimes.
+
+    Args:
+        all_times: numpy array of runtime in seconds
+        bins: number of histogram bins
+        max_width: maximum width of the histogram bars
+    """
+    if len(all_times) == 0:
+        print("No timing data available for histogram")
+        return
+
+    # Remove any NaN or invalid values
+    valid_times = all_times[np.isfinite(all_times)]
+    if len(valid_times) == 0:
+        print("No valid timing data available for histogram")
+        return
+
+    # Create histogram
+    counts, bin_edges = np.histogram(valid_times, bins=bins)
+
+    # Find the maximum count for scaling
+    max_count = np.max(counts)
+    if max_count == 0:
+        print("No data to display in histogram")
+        return
+
+    print(f"\nRuntime Distribution Histogram ({len(valid_times)} jobs):")
+    print("=" * 70)
+
+    # Calculate bin centers and widths for labeling
+    #bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    #bin_width = bin_edges[1] - bin_edges[0]
+
+    for i, count in enumerate(counts):
+        # Skip empty bins for cleaner output
+        if count == 0:
+            continue
+
+        # Calculate bar length
+        bar_length = int((count / max_count) * max_width)
+
+        # Create the bar
+        bar = "█" * bar_length
+
+        # Format the time range for this bin
+        start_time = format_time_duration(bin_edges[i])
+        end_time = format_time_duration(bin_edges[i + 1])
+
+        # Calculate percentage
+        percentage = (count / len(valid_times)) * 100
+
+        print(f"{start_time:>8} - {end_time:<8} │{bar:<{max_width}} │ {count:>6} jobs ({percentage:4.1f}%)")
+
+    print("=" * 70)
+    print(f"Legend: Each █ represents ~{max_count/max_width:.1f} jobs")
+
+def create_simple_runtime_histogram(all_times, bins=10):
+    """
+    Create a simpler ASCII histogram with fewer bins for better readability.
+    """
+    if len(all_times) == 0:
+        return
+
+    valid_times = all_times[np.isfinite(all_times)]
+    if len(valid_times) == 0:
+        return
+
+    # Use logarithmic binning for better distribution of runtime data
+    min_time = np.min(valid_times)
+    max_time = np.max(valid_times)
+
+    if min_time <= 0:
+        min_time = 1  # Avoid log(0)
+
+    # Create log-spaced bins if there's a wide range of runtimes
+    if max_time / min_time > 100:  # Wide range, use log scale
+        bin_edges = np.logspace(np.log10(min_time), np.log10(max_time), bins + 1)
+        scale_type = "log"
+    else:  # Narrow range, use linear scale
+        bin_edges = np.linspace(min_time, max_time, bins + 1)
+        scale_type = "linear"
+
+    counts, _ = np.histogram(valid_times, bins=bin_edges)
+    max_count = np.max(counts)
+
+    if max_count == 0:
+        return
+
+    print(f"\nRuntime Distribution ({scale_type} scale, {len(valid_times)} jobs):")
+    print("-" * 60)
+
+    for i, count in enumerate(counts):
+        if count == 0:
+            continue
+
+        # Scale bar length to 40 characters max
+        bar_length = int((count / max_count) * 40)
+        bar = "▓" * bar_length
+
+        start_time = format_time_duration(bin_edges[i])
+        end_time = format_time_duration(bin_edges[i + 1])
+        percentage = (count / len(valid_times)) * 100
+
+        print(f"{start_time:>8}-{end_time:<8} │{bar:<40}│ {count:>5} ({percentage:4.1f}%)")
+
+
+def display_jobhist_sacct(jobinfo, jobinfo_batch, show_histogram=False, hist_bins=10):
+    """ Print jobhist information from sacct with optional histogram. """
 
     print_header()
 
@@ -395,6 +521,16 @@ def display_jobhist_sacct(jobinfo, jobinfo_batch):
     print('Sum  over %d jobs: time %7d s or %7.1f m or %4.3f h, mem %5.1fGB' % \
         (njobs, tstat, tstat/60, tstat/3600, mstat))
 
+    if show_histogram:
+        if njobs > 0:
+            print("\nCreating runtime histogram with {} bins:".format(hist_bins))
+            create_runtime_histogram(all_times, bins=hist_bins)
+        else:
+            print("No jobs to display in histogram.")
+
+        print("\nCreating log-scale runtime histogram with {} bins:".format(hist_bins))
+        create_simple_runtime_histogram(all_times, bins=hist_bins)
+
 def concatenate_subfiles(top_dir, fn):
     bn, ext = os.path.splitext(top_dir)
     full_top_dir = format(os.path.join(os.getcwd(), top_dir))
@@ -453,13 +589,27 @@ def grep_jobhist(fn, fnstr):
 
 
 if __name__ == '__main__':
+    make_jobhist_pipe_safe() # make jobhist work properly with Unix pipes like head, tail, grep (e.g. jobhist | grep FAILED)
     description = """Print information about completed jobs.
 
 Note: RUNNING jobs will not show MemUsed"""
     parser = argparse.ArgumentParser(description=description,
                                      formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('jobids', metavar='JobId', nargs='+', help='job number')
+    parser.add_argument('--rerun', dest='rerun', action='store_true',
+        help='for jobhist on directories, ignore existing jobhist.txt')
+    parser.add_argument('--histogram', dest='histogram', action='store_true',
+                    help='display ASCII histogram of job runtime distribution')
+    parser.add_argument('--hist-bins', dest='hist_bins', type=int, default=10,
+                    help='number of histogram bins (default: 10)')
+
     args = parser.parse_args()
+    rerun = args.rerun
+    show_histogram = args.histogram
+    hist_bins = args.hist_bins
+    if show_histogram and hist_bins <= 0:
+        print("Error: --hist-bins must be a positive integer.")
+        sys.exit(1)
 
     try:
         ijobids = [int(x) for x in args.jobids]
@@ -482,7 +632,9 @@ Note: RUNNING jobs will not show MemUsed"""
                     # Display job info from swarm incase of no sbatch.log
                     display_jobhist_swarmlog(jobid, jinfo)
                 # Display job info from sacct
-                display_jobhist_sacct(jinfo, jinfo_batch)
+                display_jobhist_sacct(jinfo, jinfo_batch,
+                                      show_histogram=show_histogram,
+                                      hist_bins=hist_bins)
             else:
                 # If we can't find a job in any of the logs,
                 # try at least this week's log
@@ -499,13 +651,16 @@ Note: RUNNING jobs will not show MemUsed"""
         assert( len(args.jobids) == 1 and os.path.isdir(top_dir) ) # must specify existing subdir
         args = shlex.split("find {} -name job_id.txt".format(top_dir))
         find = subprocess.Popen(args, stdout = subprocess.PIPE)
-        for line in find.stdout:
+        args = ['sort', '-n']
+        cmd_sort = subprocess.Popen(args, stdin=find.stdout, stdout=subprocess.PIPE)
+        find.stdout.close()
+        for line in cmd_sort.stdout:
             job_id_txt = line.decode().strip()
             if not job_id_txt: continue # just in case of blank lines
             job_id_path = os.path.dirname(job_id_txt)
             jobhist_txt = os.path.join(job_id_path, jobhist_fnstr)
             incomplete_txt = os.path.join(job_id_path, incomplete_fnstr)
-            if not os.path.isfile(jobhist_txt):
+            if not os.path.isfile(jobhist_txt) or rerun:
                 with open(job_id_txt, 'r') as jf:
                     for jline in jf:
                         cjline = jline.strip()
@@ -529,8 +684,8 @@ Note: RUNNING jobs will not show MemUsed"""
                             elif os.path.isfile(incomplete_txt):
                                 os.remove(incomplete_txt)
             #if not os.path.isfile(jobhist_txt):
-        #for line in find.stdout:
-        find.communicate()
+        #for line in cmd_sort.stdout:
+        cmd_sort.communicate()
 
         # these are for convenience, most typically cat the jobhists for jobs from mrolling_submit
         #   and then grep for any failures and for max runtimes.

@@ -453,28 +453,32 @@ sub writeBatchScript
 #   do not try to create another job_id.txt if it already exists.
 # this has to be done here incase we are using sbatch in wait (blocking) mode.
   $fileContents .= "job_id_fn=\${logd}/job_id.txt\n";
-  $fileContents .= "if [[ ! -s \${job_id_fn} && \"\${SLURM_ARRAY_TASK_ID}\" == \"0\" ]]; then\n";
+  #$fileContents .= "if [[ ! -s \${job_id_fn} && \"\${SLURM_ARRAY_TASK_ID}\" == \"0\" ]]; then\n";
+  $fileContents .= "if [[ \"\${SLURM_ARRAY_TASK_ID}\" == \"0\" && ! -s \${job_id_fn} ]]; then\n";
   $fileContents .= "echo \${SLURM_ARRAY_JOB_ID} > \${job_id_fn}\n";
   $fileContents .= "fi\n";
 
 # insert a small random sleep so that jobs in large job arrays do not all start simultaneously
   #$fileContents .= "sleep \$((RANDOM % 11 + 3))\n"; # generates same integer for simultaneously started scripts
-  $fileContents .= "R=\$(date +%N)\$\$; R=\$((R % 31 + 1)); echo sleeping \$R s; sleep \$R\n";
+  $fileContents .= "R=\$(date +%N)\$\$; R=\$((R % 42 + 1)); echo sleeping \$R s; sleep \$R\n";
 
 # Write the command executed block at the top of the output
   my $ce_top = "COMMAND EXECUTED: \"";
   my $ce_bot = "\"";
 
-  $fileContents .= "exitcode=\$(($OPT{p}+1))\n"; # would indicate that command file is missing somehow
-  $fileContents .= "if [[ -s \${d}/$PAR->{singleCommandFileName} ]]; then\n";
+  # $fileContents .= "exitcode=\$(($OPT{p}+1))\n"; # would indicate that command file is missing somehow
+  # $fileContents .= "if [[ -s \${d}/$PAR->{singleCommandFileName} ]]; then\n";
   $fileContents .= "exitcode=0\n";
 
 # Run the commands in series on a single node
   if ($OPT{p}) {
     foreach my $i (0 .. $OPT{p}-1) {
       ##$fileContents .= "[[ -s \${d}/cmd.\${SLURM_ARRAY_TASK_ID}_$i ]] && ( /bin/echo '$ce_top' && /bin/cat \${d}/cmd.\${SLURM_ARRAY_TASK_ID}_$i && /bin/echo '$ce_bot' && $PAR->{shell} \${d}/cmd.\${SLURM_ARRAY_TASK_ID}_$i ";
-      $fileContents .= "if grep -q \\\"cmd.\${SLURM_ARRAY_TASK_ID}_$i\\\" \${d}/$PAR->{singleCommandFileName}; then\n";
+      $fileContents .= "cmd_i=\$((SLURM_ARRAY_TASK_ID * $OPT{p} + $i))\n";
+      $fileContents .= "if [ \$cmd_i -le $#{$SWARM->{COMMANDS}} ]; then\n";
+      #$fileContents .= "if grep -q \\\"cmd.\${SLURM_ARRAY_TASK_ID}_$i\\\" \${d}/$PAR->{singleCommandFileName}; then\n";
       my $echo = "${ce_top}cmd.\${SLURM_ARRAY_TASK_ID}_$i${ce_bot}";
+      $fileContents .= "export SWARM_ARRAY_SUBJOB_ID=$i\n";
       $fileContents .= "( /bin/echo $echo && $PAR->{shell} \${d}/$PAR->{singleCommandFileName} cmd.\${SLURM_ARRAY_TASK_ID}_$i ";
 # Determine output/error redirects
       if ($OPT{"merge-output"}) {
@@ -497,14 +501,18 @@ sub writeBatchScript
       $fileContents .= ") &\n";
       $fileContents .= "fi\n";
     }
-    $fileContents .= "fi\n";
+    #$fileContents .= "fi\n";
     $fileContents .= "wait\n";
+    # xxx - --check-msg is legacy, typically not running pipeline with this option anymore
+    #   but instead validating completion using the serialized job completion file.
     if ($OPT{'check-msg'}) {
       my $j = $OPT{p}-1;
       $fileContents .= "for i in {0..$j}; do\n";
       #$fileContents .= "if [[ -s \${d}/cmd.\${SLURM_ARRAY_TASK_ID}_\$i ]] &&";
-      $fileContents .= "if [[ -s \${d}/$PAR->{singleCommandFileName} ]]; then\n";
-      $fileContents .= "  if grep -q \\\"cmd.\${SLURM_ARRAY_TASK_ID}_\$i\\\" \${d}/$PAR->{singleCommandFileName}; then\n";
+      #$fileContents .= "if [[ -s \${d}/$PAR->{singleCommandFileName} ]]; then\n";
+      $fileContents .= "cmd_i=\$((SLURM_ARRAY_TASK_ID * $OPT{p} + i))\n";
+      $fileContents .= "if [ \$cmd_i -le $#{$SWARM->{COMMANDS}} ]; then\n";
+      #$fileContents .= "  if grep -q \\\"cmd.\${SLURM_ARRAY_TASK_ID}_\$i\\\" \${d}/$PAR->{singleCommandFileName}; then\n";
       $fileContents .= "    if tail \${logd}/$PAR->{'job-name'}_\${SLURM_ARRAY_JOB_ID}_\${SLURM_ARRAY_TASK_ID}_\$i.o";
       $fileContents .= " | grep -q 'Twas brillig, and the slithy toves'; then\n";
       $fileContents .= "      exitcode=\$((exitcode+0))\n";
@@ -514,7 +522,7 @@ sub writeBatchScript
       $fileContents .= "      exitcode=\$((exitcode+1))\n";
       $fileContents .= "    fi\n";
       $fileContents .= "  fi\n";
-      $fileContents .= "fi\n";
+      #$fileContents .= "fi\n";
       $fileContents .= "done\n";
     }
     # else {

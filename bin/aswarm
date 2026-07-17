@@ -16,46 +16,69 @@ squeue --user $(whoami) --format '%A' --states PENDING | awk '{print $1;}' | tai
 }
 
 # automatically create dictionaries of memory / num cpus keyed by each partition name
-declare -A ncpus memory gres
+declare -A ncpus memory gres nnodes
 maxmem=0
 maxcpu=0
-my_cmd='sinfo --exact -h -o "%R %c %m %G"'
+my_cmd='sinfo --exact -h -o "%R %D %X %Y %m %G"'
 lines=$(eval ${my_cmd})
 while IFS= read -r line; do
     read -ra fields <<< "$line"
-    ncpus[${fields[0]}]=${fields[1]}
-    if [ ${fields[1]} -gt $maxcpu ]; then
-      maxcpu=${fields[1]}
+    cpar=${fields[0]}
+
+    cnnodes=${fields[1]}
+    if [[ ! -v 'nnodes[${cpar}]' ]]; then
+      nnodes[${cpar}]=${cnnodes}
     fi
-    memory[${fields[0]}]=${fields[2]}
-    if [ ${fields[2]} -gt $maxmem ]; then
-      maxmem=${fields[2]}
+
+    cncores=$((fields[2] * fields[3]))
+    if [[ ! -v 'ncpus[${cpar}]' || ${cnnodes} -gt ${nnodes["${cpar}"]} ]]; then
+      ncpus[${cpar}]=${cncores}
+      if [ ${cncores} -gt $maxcpu ]; then
+        maxcpu=${cncores}
+      fi
     fi
-    gres[${fields[0]}]=${fields[3]}
+
+    cmemory=${fields[4]}
+    if [[ ! -v 'memory[${cpar}]' || ${cnnodes} -gt ${nnodes["${cpar}"]} ]]; then
+      memory[${cpar}]=${cmemory}
+      if [ ${cmemory} -gt $maxmem ]; then
+        maxmem=${cmemory}
+      fi
+    fi
+
+    cgres=${fields[5]}
+    if [[ ! -v 'gres[${cpar}]' || ${cnnodes} -gt ${nnodes["${cpar}"]} ]]; then
+      gres[${cpar}]=${cgres}
+    fi
+
+    if [[ ${cnnodes} -gt ${nnodes["${cpar}"]} ]]; then
+      nnodes[${cpar}]=${cnnodes}
+    fi
 done <<< "$lines"
-# xxx - could not figure out an easy way to get default CPU/GPU partitions
+#for k in "${!ncpus[@]}"; do
+#  printf "%s -> %s %s %s\n" "$k" "${ncpus[$k]}" "${memory[$k]}" "${gres[$k]}"
+#done
+# xxx - ideally default cpu/gpu partitions and number of gpus could be discovered automatically
+#   decided it was not worth the effort, so this is cluster specific code
 hostname=$(hostname)
 if [[ ${hostname} == soma* ]]; then
     p_cpu=CPU; p_gpu=GPU; ngpu=4
 elif [[ ${hostname} == axon* ]]; then
     p_cpu=p.axon; p_gpu=p.gpu; ngpu=1
+elif [[ ${hostname} == raven* ]]; then
+    p_cpu=general; p_gpu=gpu; ngpu=4
 fi
-# xxx - started on a generic way to read in number of gpus
-#   decided it was not worth it right now, since we still have the cluster-specific switch anyways
-# IFS=':' read -ra GRES <<< "${gres[${p_gpu}]}"
-# for j in ${!GRES[@]}; do
-#   if [ "${GRES[$j]}" == "gpu" ]; then
-#   fi
-# done
 
 # flags that are basically always kept the same, so added to the swarm command
-fixed_params="--verbose 2 --check-msg"
+#fixed_params="--verbose 2 --check-msg"
+fixed_params="--verbose 2"
 default_time="--time 24:00:00"
 
 cnt=0
 nonexclusive=
 exclusive=
 have_time=
+psplit_in=
 nprocs_in=1
 nbundle=1
 for var in "$@"; do
@@ -68,6 +91,10 @@ for var in "$@"; do
         if [ -n "$nonexclusive" ]; then
             var=1
         fi
+    elif [ "$get_psplit" == "true" ]; then
+        psplit_in=$var
+        get_psplit=false
+        var=
     elif [ "$get_nbundle" == "true" ]; then
         nbundle=$var
         get_nbundle=false
@@ -82,6 +109,9 @@ for var in "$@"; do
         get_nprocs=true
         var=-p
         nonexclusive=true
+    elif [ "$var" == "--psplit" ]; then
+        get_psplit=true
+        var=
     elif [ "$var" == "--time" ]; then
         have_time=true
     elif [ "$var" == "--exclusive" ]; then
@@ -148,14 +178,50 @@ if [[ -n "$invalid_partition" ]]; then
     exit
 fi
 
+# use the psplit option to pack, but only into a fraction of the whole node resources.
+# this results in a combination of swarm and slurm process node packing.
+if [ -n "$psplit_in" ]; then
+  IFS=',' read -ra psplit <<< "$psplit_in"
+  if [[ ${#partitions[@]} -ne ${#psplit[@]} ]]; then
+    echo "partitions and psplit must be same length"
+    exit
+  fi
+
+  maxmem=0
+  maxcpu=0
+  for j in ${!partitions[@]}; do
+    cnt=$((${ncpus[${partitions[$j]}]} / ${psplit[$j]}))
+    cng=$(perl -w -e "print ${memory[${partitions[$j]}]} / ${psplit[$j]}")
+    ncpus[${partitions[$j]}]=${cnt}
+    if [ ${cnt} -gt $maxcpu ]; then
+      maxcpu=${cnt}
+    fi
+    memory[${partitions[$j]}]=${cng}
+    #if (( $(echo "$cng > $maxmem" |bc -l) )); then
+    if awk "BEGIN { exit !($cng > $maxmem) }"; then
+      maxmem=${cng}
+    fi
+  done
+fi
+
 if [ -n "$exclusive" ]; then
   partition=${partitions[0]}
   all_args=(${all_args[@]} "-t" "${ncpus[$partition]}")
   all_args=(${all_args[@]} "-g" $(perl -w -e "print ${memory[$partition]}/1024;"))
 else
   if [[ ${#partitions[@]} -ne ${#nprocs[@]} ]]; then
-    echo "partitions and nprocs must be same length"
-    exit
+    if [[ ${#nprocs[@]} -eq 1 ]]; then
+      # this is to support packing/splitting along with submitting to multiple partitions using slurm
+      nproc=${nprocs[0]}
+      npartitions=${#partitions[@]}
+      nprocs=()
+      for ((i=0; i<npartitions; i++)); do
+        nprocs+=($nproc)
+      done
+    else
+      echo "partitions and nprocs must be same length"
+      exit
+    fi
   fi
 
   # if multiple partitions are specified, take the min resource requirements based on the packing
@@ -167,12 +233,13 @@ else
     if [[ $cnt -lt $nt ]]; then
       nt=$cnt
     fi
-    if (( $(echo "$cng < $ng" |bc -l) )); then
+    #if (( $(echo "$cng < $ng" |bc -l) )); then
+    if awk "BEGIN { exit !($cng < $ng) }"; then
       ng=$cng
     fi
   done
 
-  all_args=(${all_args[@]} "-t" "$nt")
+  all_args=(${all_args[@]} "-t" "${nt}")
   all_args=(${all_args[@]} "-g" $(perl -w -e "print $ng/1024;"))
 fi
 all_args=(${all_args[@]} $fixed_params)

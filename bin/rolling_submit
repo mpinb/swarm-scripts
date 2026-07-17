@@ -38,6 +38,10 @@ swarm_opts=
 # if force is not specified, exit with error message
 #force=
 
+# special flag to restart runs without creating subdir.
+# use with care, mostly meant for restarting top mrolling_submit jobs.
+#flat_run=
+
 # this is constant in multiple scripts.
 job_id_fn='job_id.txt'
 
@@ -84,6 +88,8 @@ for var in "$@"; do
         no_run=true
     elif [ "$var" == "--force" ]; then
         force=true
+    elif [ "$var" == "--flat-run" ]; then
+        flat_run=true
     fi
 
     #cnt=$((cnt+1))
@@ -101,6 +107,7 @@ echo "swarm_opts: ${swarm_opts}"
 echo "p_sjobs: ${p_sjobs}"
 echo "no-run: ${no_run}"
 echo "force: ${force}"
+echo "flat-run: ${flat_run}"
 echo
 
 if [ ${#swarms[@]} -eq 0 ]; then
@@ -121,6 +128,7 @@ if [ ${#swarms[@]} -eq 0 ] || [ -z ${njob_cutoff} ] || [ -z ${sleep_time} ] || [
     echo "  --nprocs <int> ...    parallel to swarms, pack n jobs per node"
     echo "  --no-run              do no actually submit anything, for debug/verify"
     echo "  --force               if the swarm subdirs already exist, remove/remake"
+    echo "  --flat-run            do not create or cd into the swarm subdirs"
     echo "run in background using for example:"
     echo "  nohup <rolling_submit_cmd> >& rolling_submit_out.txt &"
     echo
@@ -145,19 +153,21 @@ for i in ${!swarms[@]}; do
 
    # put log files into separate dirs
    subdir=_${swarms[$i]}
-   if [[ -d ${subdir} ]]; then
-       if [ -z "$force" ]; then
-           echo "'${subdir}' exists and force not specified"
-           exit
-       else
-           rm -rf ${subdir}
+   if [ -z "$flat_run" ]; then
+       if [[ -d ${subdir} ]]; then
+           if [ -z "$force" ]; then
+               echo "'${subdir}' exists and force not specified"
+               exit
+           else
+               rm -rf ${subdir}
+           fi
        fi
-   fi
-   if [ -z "$no_run" ]; then
-       mkdir ${subdir}
-       cp ${swarms[$i]} ${subdir}
-       cd ${subdir}
-   fi
+       if [ -z "$no_run" ]; then
+           mkdir ${subdir}
+           cp ${swarms[$i]} ${subdir}
+           cd ${subdir}
+       fi
+    fi
 
    # capture the submitted job_id
    if [ -z "$nprocs" ]; then
